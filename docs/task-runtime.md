@@ -6,7 +6,7 @@
 
 - `scripts/modules/TaskRuntime.luau`: reusable ModuleScript.
 - `scripts/server/script.server.luau`: server lifecycle bootstrap using a root cleanup scope.
-- `tests/task-runtime.spec.luau`: Creator self-test source.
+- `tests/task-runtime-test.server.luau`: linked Creator self-test.
 
 In Creator, link `TaskRuntime.luau` as a `ModuleScript` named `TaskRuntime` under `ScriptService`. The server bootstrap expects it at `game["ScriptService"]["TaskRuntime"]`.
 
@@ -245,7 +245,7 @@ The current game-side runtime does not automatically invoke `_Dispose()`. `Shutd
 
 ## Verification in Creator
 
-Normal Creator builds cannot execute a loose `.luau` file directly. Create a temporary `ServerScript` under `ScriptService`, link it to a `.server.luau` file, copy in the contents of `tests/task-runtime.spec.luau`, then start a local playtest.
+`tests/task-runtime-test.server.luau` is already linked as a ServerScript in this project. Start a normal local playtest and watch the console; the test runs automatically. Disable or delete the test ServerScript after verification so it does not execute during ordinary development.
 
 The test verifies result forwarding, pending and running cancellation, immediate cancellation callbacks, disconnected callbacks, automatic scope detachment, named resources, non-overlapping repeating tasks, recursive `DestroyAndAwait`, reverse-order cleanup, error handling, and task release. A successful run prints:
 
