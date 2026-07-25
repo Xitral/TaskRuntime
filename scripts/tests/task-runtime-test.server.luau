@@ -183,6 +183,17 @@ expect(allSuccess, "all should complete when every child succeeds")
 expectEqual(allResults[1][1], "first", "all should preserve input order")
 expectEqual(allResults[2][1], "second", "all should preserve second result")
 
+local allFailure = TaskRuntime.spawn(function()
+	error("fail fast")
+end)
+local allSlow = TaskRuntime.delay(0.5, function()
+	return "too late"
+end)
+local failedAll = TaskRuntime.all({ allFailure, allSlow })
+local failedAllSuccess = failedAll:Await(1)
+expect(not failedAllSuccess, "all should fail when a child fails")
+expectEqual(allSlow.State, "cancelled", "all should cancel unfinished siblings before completing")
+
 local settleSuccessTask = TaskRuntime.spawn(function()
 	return 10
 end)
@@ -213,9 +224,13 @@ end)
 local anySuccessTask = TaskRuntime.delay(0.005, function()
 	return "winner"
 end)
-local anyTask = TaskRuntime.any({ anyFailure, anySuccessTask })
+local anySlow = TaskRuntime.delay(0.5, function()
+	return "late winner"
+end)
+local anyTask = TaskRuntime.any({ anyFailure, anySuccessTask, anySlow })
 local anySuccess, anyIndex, anyValue = anyTask:Await(1)
 expect(anySuccess and anyIndex == 2 and anyValue == "winner", "any should return the first successful task")
+expectEqual(anySlow.State, "cancelled", "any should cancel losers before completing")
 
 -- Semaphores and mapLimit enforce bounded concurrency.
 local simultaneous = 0

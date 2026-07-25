@@ -3,7 +3,7 @@
 -- bounded concurrency, diagnostics, and deterministic cleanup for Polytoria Luau.
 
 local TaskRuntime = {}
-TaskRuntime.VERSION = "3.0.1"
+TaskRuntime.VERSION = "3.0.2"
 
 local Runtime = {}
 Runtime.__index = Runtime
@@ -1274,23 +1274,30 @@ function Runtime:_Aggregate(kind, handles, setup)
 		end
 		connections = {}
 	end
-	local function complete(values)
+	local function settle(finalize, beforeFinish)
 		if settled or aggregate:IsDone() then
 			return false
 		end
 		settled = true
 		disconnectAll()
-		self:_CompleteHandle(aggregate, values)
+		if beforeFinish ~= nil then
+			local succeeded, effectError = pcall(beforeFinish)
+			if not succeeded then
+				self:_Warn("[TaskRuntime] aggregate pre-finish action failed: " .. tostring(effectError))
+			end
+		end
+		finalize()
 		return true
 	end
-	local function fail(taskError)
-		if settled or aggregate:IsDone() then
-			return false
-		end
-		settled = true
-		disconnectAll()
-		self:_FailHandle(aggregate, taskError)
-		return true
+	local function complete(values, beforeFinish)
+		return settle(function()
+			self:_CompleteHandle(aggregate, values)
+		end, beforeFinish)
+	end
+	local function fail(taskError, beforeFinish)
+		return settle(function()
+			self:_FailHandle(aggregate, taskError)
+		end, beforeFinish)
 	end
 	table.insert(aggregate._cancelHooks, function(reason)
 		disconnectAll()
@@ -1327,12 +1334,15 @@ function Runtime:all(handles, options)
 				remaining = remaining - 1
 				if failFast and not outcome.Success then
 					local reason = outcome.Error and outcome.Error.Message or outcome.CancellationReason or outcome.Status
-					local settledNow = fail(self:_MakeTaskError(aggregate, "CHILD_TASK_FAILED", "child " .. tostring(index) .. " " .. outcome.Status .. ": " .. tostring(reason), {
-						Cause = outcome.Error,
-					}))
-					if settledNow and cancelOnFailure then
-						cancelRemaining(handles, index, "TaskRuntime.all child did not complete")
+					local beforeFinish = nil
+					if cancelOnFailure then
+						beforeFinish = function()
+							cancelRemaining(handles, index, "TaskRuntime.all child did not complete")
+						end
 					end
+					fail(self:_MakeTaskError(aggregate, "CHILD_TASK_FAILED", "child " .. tostring(index) .. " " .. outcome.Status .. ": " .. tostring(reason), {
+						Cause = outcome.Error,
+					}), beforeFinish)
 					return
 				end
 				if remaining == 0 then
@@ -1384,7 +1394,12 @@ function Runtime:race(handles, options)
 						return
 					end
 					local outcome = completedHandle:GetOutcome()
-					local settledNow = false
+					local beforeFinish = nil
+					if cancelLosers then
+						beforeFinish = function()
+							cancelRemaining(handles, index, "TaskRuntime.race lost")
+						end
+					end
 					if outcome.Success then
 						local values = { n = (outcome.Values and outcome.Values.n or 0) + 1 }
 						values[1] = index
@@ -1393,15 +1408,12 @@ function Runtime:race(handles, options)
 								values[valueIndex + 1] = outcome.Values[valueIndex]
 							end
 						end
-						settledNow = complete(values)
+						complete(values, beforeFinish)
 					else
 						local reason = outcome.Error and outcome.Error.Message or outcome.CancellationReason or outcome.Status
-						settledNow = fail(self:_MakeTaskError(aggregate, "RACE_WINNER_FAILED", "winner " .. tostring(index) .. " " .. outcome.Status .. ": " .. tostring(reason), {
+						fail(self:_MakeTaskError(aggregate, "RACE_WINNER_FAILED", "winner " .. tostring(index) .. " " .. outcome.Status .. ": " .. tostring(reason), {
 							Cause = outcome.Error,
-						}))
-					end
-					if settledNow and cancelLosers then
-						cancelRemaining(handles, index, "TaskRuntime.race lost")
+						}), beforeFinish)
 					end
 				end)
 			end
@@ -1437,10 +1449,13 @@ function Runtime:any(handles, options)
 								values[valueIndex + 1] = outcome.Values[valueIndex]
 							end
 						end
-						local settledNow = complete(values)
-						if settledNow and cancelLosers then
-							cancelRemaining(handles, index, "TaskRuntime.any lost")
+						local beforeFinish = nil
+						if cancelLosers then
+							beforeFinish = function()
+								cancelRemaining(handles, index, "TaskRuntime.any lost")
+							end
 						end
+						complete(values, beforeFinish)
 						return
 					end
 					failures[index] = outcome
