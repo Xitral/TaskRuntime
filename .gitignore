@@ -1,2 +1,12 @@
 # Polytoria specific ignores
 .poly/
+
+# Release tooling
+dist/
+__pycache__/
+*.py[cod]
+*.log
+
+# Local operating system files
+.DS_Store
+Thumbs.db
