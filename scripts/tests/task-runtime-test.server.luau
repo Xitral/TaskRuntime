@@ -66,10 +66,11 @@ expect(completedOutcome.Success, "completed outcome should report success")
 expectEqual(completedOutcome.Values[1], 10, "completed outcome should include values")
 
 -- Await timeout does not cancel the task.
-local delayedResult = TaskRuntime.delay(0.05, function()
+-- Use clearly separated deadlines because Creator/server waits resume on scheduler ticks.
+local delayedResult = TaskRuntime.delay(0.5, function()
 	return "later"
 end)
-local timedOutcome = delayedResult:AwaitOutcome(0.005)
+local timedOutcome = delayedResult:AwaitOutcome(0.05)
 expectEqual(timedOutcome.Status, "timeout", "AwaitOutcome should report timeout")
 expectEqual(timedOutcome.Error.Code, "AWAIT_TIMEOUT", "timeout outcome should have a code")
 expect(not delayedResult:IsCancelled(), "await timeout should not cancel the task")
@@ -247,27 +248,27 @@ queue:Close("test complete")
 
 -- Debounce replaces pending work. Throttle suppresses calls inside its window.
 local debounceCount = 0
-local firstDebounce = TaskRuntime.debounce("self-test", 0.03, function()
+local firstDebounce = TaskRuntime.debounce("self-test", 0.2, function()
 	debounceCount = debounceCount + 1
 end)
-TaskRuntime.wait(0.01)
-local secondDebounce = TaskRuntime.debounce("self-test", 0.03, function()
+TaskRuntime.wait(0.05)
+local secondDebounce = TaskRuntime.debounce("self-test", 0.2, function()
 	debounceCount = debounceCount + 1
 end)
 expectEqual(firstDebounce.State, "cancelled", "debounce should cancel previous work")
 expect(secondDebounce:Await(1), "replacement debounce should run")
 expectEqual(debounceCount, 1, "only the latest debounce should execute")
 
-local firstThrottle = TaskRuntime.throttle("self-test", 0.03, function()
+local firstThrottle = TaskRuntime.throttle("self-test", 0.2, function()
 	return "first"
 end)
-local blockedThrottle, activeThrottle = TaskRuntime.throttle("self-test", 0.03, function()
+local blockedThrottle, activeThrottle = TaskRuntime.throttle("self-test", 0.2, function()
 	return "blocked"
 end)
 expect(blockedThrottle == nil and activeThrottle == firstThrottle, "throttle should return the active call")
 expect(firstThrottle:Await(1), "first throttle call should complete")
-TaskRuntime.wait(0.04)
-local laterThrottle = TaskRuntime.throttle("self-test", 0.03, function()
+TaskRuntime.wait(0.25)
+local laterThrottle = TaskRuntime.throttle("self-test", 0.2, function()
 	return "later"
 end)
 local laterThrottleSuccess, laterThrottleValue = laterThrottle:Await(1)
@@ -300,15 +301,15 @@ expect(rootContextTask.ParentTaskId == nil, "root context should not invent a pa
 -- Scope cleanup deadlines continue after one cleanup operation times out.
 local timedCleanupFinished = false
 local cleanupScope = TaskRuntime.scope("CleanupTimeoutTest", {
-	resourceCleanupTimeout = 0.01,
-	cleanupTimeout = 0.1,
+	resourceCleanupTimeout = 0.05,
+	cleanupTimeout = 0.5,
 })
 cleanupScope:Add(function()
-	TaskRuntime.wait(0.05)
+	TaskRuntime.wait(0.2)
 	timedCleanupFinished = true
 end, {
 	name = "SlowCleanup",
-	timeout = 0.01,
+	timeout = 0.05,
 })
 local laterCleanupRan = false
 cleanupScope:Add(function()
@@ -322,7 +323,7 @@ expect(not cleanupSuccess and cleanupReason == "cleanup failed", "cleanup timeou
 expect(#cleanupErrors >= 1, "cleanup timeout should produce an error record")
 expectEqual(cleanupErrors[1].Code, "CLEANUP_TIMEOUT", "cleanup error should have a code")
 expect(laterCleanupRan, "cleanup should continue after a timeout")
-TaskRuntime.wait(0.06)
+TaskRuntime.wait(0.25)
 expect(timedCleanupFinished, "cooperative cleanup callback should eventually exit")
 
 -- Diagnostics include history, stats, parents, scopes, and deadlines.
