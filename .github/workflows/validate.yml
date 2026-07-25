@@ -1,0 +1,24 @@
+name: Validate
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  repository:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile validation tools
+        run: python3 -m compileall -q tools
+      - name: Validate release metadata
+        run: python3 tools/validate_release.py
+      - name: Build release package
+        run: python3 tools/build_release.py
