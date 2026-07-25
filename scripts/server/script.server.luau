@@ -7,7 +7,10 @@ local TaskRuntime = require(game["ScriptService"]["TaskRuntime"])
 local rootScope = TaskRuntime.scope("ServerRoot")
 
 -- Example:
--- rootScope:Delay(5, function()
+-- rootScope:Delay(5, function(token)
+-- 	if token:IsCancelled() then
+-- 		return
+-- 	end
 -- 	print("Five seconds elapsed")
 -- end)
 --
