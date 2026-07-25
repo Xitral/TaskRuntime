@@ -1,0 +1,77 @@
+name: Publish TaskRuntime release with diagnostics
+
+on:
+  push:
+    paths:
+      - ".github/workflows/publish-taskruntime-release-diagnostic.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Remove one-time workflow
+        run: |
+          rm -f .github/workflows/publish-taskruntime-release-diagnostic.yml
+          rm -f RELEASE_FAILURE.log
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Remove diagnostic release trigger"
+          git push origin master
+
+      - name: Run release process
+        id: release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          {
+            set -x
+            python3 tools/validate_release.py
+            python3 tools/build_release.py
+            version="$(cat VERSION)"
+            tag="v${version}"
+            remote_sha="$(git ls-remote --tags origin "refs/tags/${tag}^{}" | awk '{print $1}')"
+            if [ -z "${remote_sha}" ]; then
+              remote_sha="$(git ls-remote --tags origin "refs/tags/${tag}" | awk '{print $1}')"
+            fi
+            if [ -n "${remote_sha}" ] && [ "${remote_sha}" != "$(git rev-parse HEAD)" ]; then
+              echo "Existing tag ${tag} points to ${remote_sha}, not $(git rev-parse HEAD)" >&2
+              exit 1
+            fi
+            if [ -z "${remote_sha}" ]; then
+              git tag -a "${tag}" -m "TaskRuntime ${version}"
+              git push origin "${tag}"
+            fi
+            if gh release view "${tag}" >/dev/null 2>&1; then
+              gh release upload "${tag}" dist/* --clobber
+            else
+              gh release create "${tag}" dist/* --verify-tag --generate-notes --title "TaskRuntime ${tag}"
+            fi
+          } > /tmp/taskruntime-release.log 2>&1
+          code=$?
+          cat /tmp/taskruntime-release.log
+          echo "code=${code}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Persist failure log
+        if: steps.release.outputs.code != '0'
+        run: |
+          cp /tmp/taskruntime-release.log RELEASE_FAILURE.log
+          git add RELEASE_FAILURE.log
+          git commit -m "Record TaskRuntime release failure"
+          git push origin master
+          exit 1
+
+      - name: Confirm release
+        if: steps.release.outputs.code == '0'
+        run: echo "TaskRuntime release published"
