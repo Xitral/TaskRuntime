@@ -6,6 +6,7 @@
 
 - `scripts/modules/TaskRuntime.luau`: reusable ModuleScript.
 - `scripts/client/script.server.luau`: server lifecycle bootstrap using a root cleanup scope.
+- `tests/task-runtime.spec.luau`: manual Creator self-test.
 
 In Creator, link `TaskRuntime.luau` as a `ModuleScript` named `TaskRuntime` under `ScriptService`. The server bootstrap expects it at `game["ScriptService"]["TaskRuntime"]`.
 
@@ -90,3 +91,7 @@ end
 ```
 
 The current game-side runtime does not automatically invoke `_Dispose()`. `Shutdown()` can be called explicitly with `BaseScript:Call()` today, while `_Dispose()` is already in place for a future engine lifecycle hook.
+
+## Verification
+
+After linking the module, run `tests/task-runtime.spec.luau` manually in Creator. It verifies argument/result forwarding, delay cancellation, scope-owned task cancellation, reverse-order cleanup, error handling, and task release.
