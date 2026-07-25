@@ -1,4 +1,4 @@
--- TaskRuntime production self-test.
+-- TaskRuntime self-test.
 -- Link this file to a ServerScript under ScriptService and run a local playtest.
 
 local TaskRuntime = require(game["ScriptService"]["TaskRuntime"])
@@ -451,7 +451,7 @@ local taskFailures = supervisedScope:GetTaskFailures()
 expect(#taskFailures == 1, "supervisor should record owned task failure")
 expectContains(taskFailures[1].Error, "supervised failure", "task failure record should include error")
 
--- Snapshot and active-count filtering expose production diagnostics.
+-- Snapshot and active-count filtering expose runtime diagnostics.
 local diagnosticStarted = false
 local diagnosticTask = TaskRuntime.spawn(function(token)
 	diagnosticStarted = true
@@ -490,4 +490,4 @@ TaskRuntime.setCleanupErrorHandler(nil)
 TaskRuntime.wait(0)
 expect(TaskRuntime.getActiveCount() == 0, "all self-test tasks should be released")
 
-print("TaskRuntime industry-grade self-test passed")
+print("TaskRuntime self-test passed")
