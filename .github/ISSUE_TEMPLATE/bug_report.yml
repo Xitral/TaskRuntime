@@ -1,0 +1,52 @@
+name: Bug report
+description: Report incorrect TaskRuntime behavior
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for taking the time to report a problem.
+  - type: input
+    id: version
+    attributes:
+      label: TaskRuntime version
+      placeholder: 3.0.3
+    validations:
+      required: true
+  - type: input
+    id: polytoria
+    attributes:
+      label: Polytoria version or build
+      description: Include the Creator or engine version when available.
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the actual and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include the smallest script that reproduces the issue.
+      render: luau
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Logs or stack trace
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I tested with the latest released version.
+          required: true
+        - label: I searched existing issues for the same problem.
+          required: true
