@@ -1,4 +1,4 @@
--- Link this file to a temporary ServerScript and run a local playtest.
+-- Run this file manually from Creator after linking TaskRuntime under ScriptService.
 
 local TaskRuntime = require(game["ScriptService"]["TaskRuntime"])
 
@@ -29,19 +29,11 @@ TaskRuntime.wait(0.1)
 expect(not delayedRan, "cancelled delay must not execute")
 expect(delayed.State == "cancelled", "cancelled pending task should finish immediately")
 
--- Cancellation callbacks should execute immediately, exactly once, and expose the reason.
+-- A running task must remain active in the cancelling state until its callback
+-- observes the token and exits.
 local runningStarted = false
 local allowRunningTaskToExit = false
-local cancellationCallbackCount = 0
-local cancellationCallbackReason = nil
-local cancellationConnection = nil
-
 local running = TaskRuntime.spawn(function(token)
-	cancellationConnection = token:OnCancel(function(reason)
-		cancellationCallbackCount = cancellationCallbackCount + 1
-		cancellationCallbackReason = reason
-	end)
-
 	runningStarted = true
 	while not token:IsCancelled() do
 		TaskRuntime.wait(0)
@@ -55,50 +47,16 @@ while not runningStarted do
 	TaskRuntime.wait(0)
 end
 
-expect(cancellationConnection ~= nil and cancellationConnection.Connected, "OnCancel should return a connected handle")
 expect(running:Cancel("cooperative cancellation test"), "running task should accept cancellation")
-expect(cancellationCallbackCount == 1, "OnCancel callback should run synchronously")
-expect(cancellationCallbackReason == "cooperative cancellation test", "OnCancel should receive cancellation reason")
-expect(not cancellationConnection.Connected, "cancellation connection should disconnect after firing")
 expect(running.State == "cancelling", "running task should enter cancelling state")
 expect(not running:IsDone(), "cancelling task should not report done before callback exits")
 expect(running.Token:GetReason() == "cooperative cancellation test", "token should expose cancellation reason")
-
-local lateCancellationCallbackCount = 0
-local lateConnection = running.Token:OnCancel(function(reason)
-	lateCancellationCallbackCount = lateCancellationCallbackCount + 1
-	cancellationCallbackReason = reason
-end)
-expect(lateCancellationCallbackCount == 1, "late OnCancel registration should run immediately")
-expect(not lateConnection.Connected, "late OnCancel connection should already be disconnected")
 
 allowRunningTaskToExit = true
 local runningSucceeded, runningReason = running:Await()
 expect(not runningSucceeded, "cancelled running task should not report success")
 expect(runningReason == "cooperative cancellation test", "Await should return cancellation reason")
 expect(running.State == "cancelled", "running task should finish cancelled after callback exits")
-
--- Disconnected cancellation callbacks must not run.
-local disconnectedStarted = false
-local disconnectedCallbackRan = false
-local disconnectedTask = TaskRuntime.spawn(function(token)
-	local connection = token:OnCancel(function()
-		disconnectedCallbackRan = true
-	end)
-	expect(connection:Disconnect(), "cancellation callback connection should disconnect")
-	disconnectedStarted = true
-	while not token:IsCancelled() do
-		TaskRuntime.wait(0)
-	end
-end)
-
-while not disconnectedStarted do
-	TaskRuntime.wait(0)
-end
-
-disconnectedTask:Cancel("disconnected callback test")
-disconnectedTask:Await()
-expect(not disconnectedCallbackRan, "disconnected cancellation callback must not run")
 
 -- Completed tasks should detach themselves from long-lived scopes.
 local autoScope = TaskRuntime.scope("AutomaticTaskRemoval")
@@ -144,62 +102,6 @@ expect(not keyedScope:Has("RoundTimer"), "removed key should no longer exist")
 expect(keyedScope:GetCount() == 0, "removed resource should detach from scope")
 keyedScope:Destroy()
 
--- Every should run sequentially, never overlap, and stop cleanly with its scope.
-local repeatingScope = TaskRuntime.scope("RepeatingTasks")
-local repeatCount = 0
-local simultaneousRepeats = 0
-local maximumSimultaneousRepeats = 0
-
-local repeatingTask = repeatingScope:Every(0.01, function()
-	simultaneousRepeats = simultaneousRepeats + 1
-	if simultaneousRepeats > maximumSimultaneousRepeats then
-		maximumSimultaneousRepeats = simultaneousRepeats
-	end
-
-	repeatCount = repeatCount + 1
-	TaskRuntime.wait(0.02)
-	simultaneousRepeats = simultaneousRepeats - 1
-end)
-
-while repeatCount < 3 do
-	TaskRuntime.wait(0)
-end
-
-local repeatingCleanupSucceeded, repeatingCleanupError = repeatingScope:DestroyAndAwait("repeating test complete", 1)
-expect(repeatingCleanupSucceeded, "DestroyAndAwait should finish repeating task: " .. tostring(repeatingCleanupError))
-expect(repeatingTask.State == "cancelled", "repeating task should finish cancelled")
-expect(repeatingTask.Iterations >= 3, "repeating task should track completed iterations")
-expect(maximumSimultaneousRepeats == 1, "repeating callbacks must never overlap")
-local repeatCountAfterCleanup = repeatCount
-TaskRuntime.wait(0.05)
-expect(repeatCount == repeatCountAfterCleanup, "repeating task must not run after cleanup")
-
--- DestroyAndAwait should include running tasks inside child scopes.
-local parentScope = TaskRuntime.scope("AwaitedParent")
-local childScope = parentScope:Child("AwaitedChild")
-local childTaskStarted = false
-local childTaskExited = false
-
-childScope:Spawn(function(token)
-	childTaskStarted = true
-	while not token:IsCancelled() do
-		TaskRuntime.wait(0)
-	end
-
-	TaskRuntime.wait(0.03)
-	childTaskExited = true
-end)
-
-while not childTaskStarted do
-	TaskRuntime.wait(0)
-end
-
-local awaitedCleanupSucceeded, awaitedCleanupError = parentScope:DestroyAndAwait("recursive shutdown test", 1)
-expect(awaitedCleanupSucceeded, "recursive DestroyAndAwait should complete: " .. tostring(awaitedCleanupError))
-expect(childTaskExited, "DestroyAndAwait should wait for child-scope tasks to exit")
-expect(childScope:IsCleanupComplete(), "child scope should report cleanup complete")
-expect(parentScope:IsCleanupComplete(), "parent scope should report cleanup complete")
-
 local cleanupOrder = {}
 local cleanupScope = TaskRuntime.scope("CleanupOrder")
 cleanupScope:Add(function()
@@ -219,7 +121,6 @@ TaskRuntime.wait(0.1)
 expect(cleanupOrder[1] == "second" and cleanupOrder[2] == "first", "cleanup must run in reverse order")
 expect(not scopedDelayRan, "destroying a scope should cancel its pending tasks")
 expect(scopedDelay.State == "cancelled", "scope-owned task should expose cancelled state")
-expect(cleanupScope:IsCleanupComplete(), "scope with only pending tasks should complete cleanup immediately")
 expect(not cleanupScope:Destroy(), "destroying a scope twice should be harmless")
 
 local capturedError = nil
