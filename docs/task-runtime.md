@@ -1,6 +1,6 @@
 # TaskRuntime
 
-`TaskRuntime` is a structured asynchronous task and cleanup library for Polytoria Luau. It combines cancellable scheduling, bounded waiting, retries, task composition, production diagnostics, and deterministic resource cleanup.
+`TaskRuntime` is a structured asynchronous task and cleanup library for Polytoria Luau. It combines cancellable scheduling, bounded waiting, retries, task composition, runtime diagnostics, and deterministic resource cleanup.
 
 ## Why this is needed
 
@@ -25,6 +25,7 @@ A scope only manages resources registered with it. Raw `spawn`, raw signal conne
 - `scripts/modules/TaskRuntime.luau`: reusable ModuleScript
 - `scripts/server/script.server.luau`: root server lifecycle example
 - `scripts/tests/task-runtime-test.server.luau`: Creator self-test
+- `docs/task-runtime-examples.md`: copy-paste usage examples
 
 In Creator, link `scripts/modules/TaskRuntime.luau` to a `ModuleScript` named `TaskRuntime` under `ScriptService`.
 
@@ -66,6 +67,8 @@ end
 ```
 
 When `stopRound()` runs, the pending timer is cancelled and the signal connection is disconnected.
+
+More complete patterns are available in [TaskRuntime examples](task-runtime-examples.md).
 
 ## Task model
 
@@ -221,7 +224,7 @@ print(task:GetMetadata("playerID"))
 print(task:GetElapsedTime())
 ```
 
-Names and metadata appear in production snapshots.
+Names and metadata appear in runtime snapshots.
 
 ## Retries
 
@@ -412,9 +415,9 @@ Use `DestroyAndAwait()` when the next action must not begin until all owned task
 local success, reason = scope:DestroyAndAwait("round ended", 5)
 ```
 
-A timeout is recommended for production shutdown paths. Do not call `DestroyAndAwait()` from a task owned by the same scope because that task would wait for itself.
+A timeout is recommended for shutdown paths. Do not call `DestroyAndAwait()` from a task owned by the same scope because that task would wait for itself.
 
-## Production diagnostics
+## Runtime diagnostics
 
 ```luau
 local snapshot = TaskRuntime.getSnapshot()
@@ -504,7 +507,7 @@ scripts/tests/task-runtime-test.server.luau
 Start a normal local playtest. A successful run prints:
 
 ```text
-TaskRuntime industry-grade self-test passed
+TaskRuntime self-test passed
 ```
 
 The self-test covers normal execution and intentional failure paths, including:
