@@ -121,6 +121,7 @@ function CallbackConnection:Disconnect()
 	if entry ~= nil then
 		entry.Active = false
 		entry.Callback = nil
+		entry.Connection = nil
 	end
 	self._entry = nil
 	return true
@@ -137,12 +138,32 @@ local function registerCallback(entries, callback)
 	local entry = {
 		Active = true,
 		Callback = callback,
+		Connection = nil,
 	}
-	table.insert(entries, entry)
-	return setmetatable({
+	local connection = setmetatable({
 		Connected = true,
 		_entry = entry,
 	}, CallbackConnection)
+	entry.Connection = connection
+	table.insert(entries, entry)
+	return connection
+end
+
+local function consumeCallback(entry)
+	if not entry.Active or entry.Callback == nil then
+		return nil
+	end
+
+	local callback = entry.Callback
+	entry.Active = false
+	entry.Callback = nil
+	local connection = entry.Connection
+	if connection ~= nil then
+		connection.Connected = false
+		connection._entry = nil
+	end
+	entry.Connection = nil
+	return callback
 end
 
 local function makeToken()
@@ -223,10 +244,8 @@ function CancellationToken:_Cancel(reason)
 	local callbacks = self._cancelCallbacks
 	self._cancelCallbacks = {}
 	for _, entry in ipairs(callbacks) do
-		if entry.Active and entry.Callback ~= nil then
-			local callback = entry.Callback
-			entry.Active = false
-			entry.Callback = nil
+		local callback = consumeCallback(entry)
+		if callback ~= nil then
 			invokeSafely(callback, "cancellation callback failed", self._reason)
 		end
 	end
@@ -309,10 +328,8 @@ local function finishHandle(handle, state)
 	local callbacks = handle._completionCallbacks
 	handle._completionCallbacks = {}
 	for _, entry in ipairs(callbacks) do
-		if entry.Active and entry.Callback ~= nil then
-			local callback = entry.Callback
-			entry.Active = false
-			entry.Callback = nil
+		local callback = consumeCallback(entry)
+		if callback ~= nil then
 			invokeSafely(callback, "completion callback failed", handle)
 		end
 	end
@@ -1078,10 +1095,8 @@ function CleanupScope:_CheckCleanupComplete()
 	local callbacks = self._cleanupCallbacks
 	self._cleanupCallbacks = {}
 	for _, entry in ipairs(callbacks) do
-		if entry.Active and entry.Callback ~= nil then
-			local callback = entry.Callback
-			entry.Active = false
-			entry.Callback = nil
+		local callback = consumeCallback(entry)
+		if callback ~= nil then
 			invokeSafely(callback, "scope completion callback failed", self)
 		end
 	end
