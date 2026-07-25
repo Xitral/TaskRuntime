@@ -3,7 +3,7 @@
 -- bounded concurrency, diagnostics, and deterministic cleanup for Polytoria Luau.
 
 local TaskRuntime = {}
-TaskRuntime.VERSION = "3.0.0"
+TaskRuntime.VERSION = "3.0.1"
 
 local Runtime = {}
 Runtime.__index = Runtime
@@ -657,7 +657,10 @@ function Runtime:_AwaitRegistration(register, timeoutSeconds, timeoutValues)
 		end
 	end
 
-	if isYieldable() then
+	-- Polytoria runs pcall callbacks in an engine-managed coroutine. A raw
+	-- coroutine.yield inside that callback is treated as the callback returning,
+	-- so waits inside TaskRuntime tasks must yield through the engine scheduler.
+	if self:_GetCurrentTask() == nil and isYieldable() then
 		parkedThread = coroutine.running()
 		return coroutine.yield({ __taskRuntimePark = true })
 	end
@@ -842,13 +845,16 @@ function Runtime:_RunCallback(handle, callback, args)
 	end
 	handle.State = "running"
 	handle.StartedAt = self:_Now()
-	local thread = coroutine and coroutine.running and coroutine.running() or nil
-	if thread ~= nil then
-		self._currentTasks[thread] = handle
-	end
-	local callResults = pack(pcall(callback, handle.Token, unpackPacked(args)))
-	if thread ~= nil then
-		self._currentTasks[thread] = nil
+	local callbackThread = nil
+	local callResults = pack(pcall(function()
+		callbackThread = coroutine and coroutine.running and coroutine.running() or nil
+		if callbackThread ~= nil then
+			self._currentTasks[callbackThread] = handle
+		end
+		return callback(handle.Token, unpackPacked(args))
+	end))
+	if callbackThread ~= nil then
+		self._currentTasks[callbackThread] = nil
 	end
 	if handle.Cancelled then
 		self:_FinishHandle(handle, "cancelled")

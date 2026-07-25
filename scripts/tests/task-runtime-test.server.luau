@@ -158,6 +158,18 @@ expect(retrySuccess and retryValue == "recovered", "retry should return successf
 expectEqual(successfulAttempt, 3, "retry should expose successful attempt")
 expectEqual(retryAttempts, 3, "retry should stop after success")
 
+-- Waiting from inside a task callback must not be mistaken for callback completion.
+local nestedAwait = TaskRuntime.spawn(function()
+	local child = TaskRuntime.delay(0.05, function()
+		return "child done"
+	end)
+	local childSuccess, childValue = child:Await(1)
+	expect(childSuccess and childValue == "child done", "task callback should await its child")
+	return "parent done"
+end)
+local nestedAwaitSuccess, nestedAwaitValue = nestedAwait:Await(2)
+expect(nestedAwaitSuccess and nestedAwaitValue == "parent done", "nested await should complete the parent")
+
 -- all, settle, race, and any use completion callbacks rather than frame polling.
 local first = TaskRuntime.delay(0.02, function()
 	return "first"
