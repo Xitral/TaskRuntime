@@ -60,10 +60,16 @@ expect(running.State == "cancelled", "running task should finish cancelled after
 
 -- Completed tasks should detach themselves from long-lived scopes.
 local autoScope = TaskRuntime.scope("AutomaticTaskRemoval")
+local allowScopedTaskToFinish = false
 local scopedCompletion = autoScope:Spawn(function()
+	while not allowScopedTaskToFinish do
+		TaskRuntime.wait(0)
+	end
 	return "complete"
 end)
+
 expect(autoScope:GetCount() == 1, "scope should initially own scheduled task")
+allowScopedTaskToFinish = true
 local scopedSucceeded = scopedCompletion:Await()
 expect(scopedSucceeded, "scope-owned task should complete")
 expect(autoScope:GetCount() == 0, "completed task should automatically detach from scope")
