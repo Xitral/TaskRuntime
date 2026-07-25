@@ -26,6 +26,7 @@ First supported public release.
 - Deterministic virtual-time testing
 - Creator integration and stress tests
 - Automated validation and tagged-release packaging
+- Public disclosure of AI-assisted development and documentation
 
 ### Fixed
 
