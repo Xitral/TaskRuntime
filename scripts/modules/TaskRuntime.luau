@@ -13,6 +13,9 @@ TaskHandle.__index = TaskHandle
 local CancellationToken = {}
 CancellationToken.__index = CancellationToken
 
+local CancellationConnection = {}
+CancellationConnection.__index = CancellationConnection
+
 local CleanupScope = {}
 CleanupScope.__index = CleanupScope
 
@@ -58,11 +61,36 @@ end
 
 local errorHandler = reportError
 
+local function invokeCancellationCallback(callback, reason)
+	local succeeded, callbackError = pcall(callback, reason)
+	if not succeeded then
+		warn("[TaskRuntime] cancellation callback failed: " .. tostring(callbackError))
+	end
+end
+
 local function makeToken()
 	return setmetatable({
 		_cancelled = false,
 		_reason = nil,
+		_cancelCallbacks = {},
+		_nextCancelCallbackId = 0,
 	}, CancellationToken)
+end
+
+function CancellationConnection:Disconnect()
+	if not self.Connected then
+		return false
+	end
+
+	self.Connected = false
+	local token = self._token
+	if token ~= nil and token._cancelCallbacks[self._id] == self then
+		token._cancelCallbacks[self._id] = nil
+	end
+
+	self._token = nil
+	self._callback = nil
+	return true
 end
 
 function CancellationToken:IsCancelled()
@@ -71,6 +99,33 @@ end
 
 function CancellationToken:GetReason()
 	return self._reason
+end
+
+-- Registers a callback that runs synchronously when cancellation is requested.
+-- The returned connection can be placed in a cleanup scope or disconnected directly.
+function CancellationToken:OnCancel(callback)
+	assertCallback(callback, "CancellationToken:OnCancel")
+
+	if self._cancelled then
+		invokeCancellationCallback(callback, self._reason)
+		return setmetatable({
+			Connected = false,
+			_token = nil,
+			_id = nil,
+			_callback = nil,
+		}, CancellationConnection)
+	end
+
+	self._nextCancelCallbackId = self._nextCancelCallbackId + 1
+	local connection = setmetatable({
+		Connected = true,
+		_token = self,
+		_id = self._nextCancelCallbackId,
+		_callback = callback,
+	}, CancellationConnection)
+
+	self._cancelCallbacks[connection._id] = connection
+	return connection
 end
 
 -- Waits in short slices so cancellation can be observed without waiting for the
@@ -111,8 +166,24 @@ function CancellationToken:_Cancel(reason)
 	if self._cancelled then
 		return false
 	end
+
 	self._cancelled = true
 	self._reason = reason or "cancelled"
+
+	local callbacks = self._cancelCallbacks
+	self._cancelCallbacks = {}
+
+	for _, connection in pairs(callbacks) do
+		local callback = connection._callback
+		connection.Connected = false
+		connection._token = nil
+		connection._callback = nil
+
+		if callback ~= nil then
+			invokeCancellationCallback(callback, self._reason)
+		end
+	end
+
 	return true
 end
 
@@ -130,6 +201,8 @@ local function makeHandle(kind)
 		FinishedAt = nil,
 		Error = nil,
 		Results = nil,
+		Iterations = 0,
+		SkippedIntervals = 0,
 		Token = makeToken(),
 		_completionCallbacks = {},
 	}, TaskHandle)
@@ -309,6 +382,62 @@ function TaskRuntime.delay(seconds, callback, ...)
 	return handle
 end
 
+-- Runs a callback repeatedly without overlap. The first run occurs after one
+-- interval. Scheduling is anchored to the intended cadence; missed intervals are
+-- skipped instead of being replayed in a burst.
+function TaskRuntime.every(seconds, callback, ...)
+	assertSeconds(seconds, "TaskRuntime.every", false)
+	assertCallback(callback, "TaskRuntime.every")
+
+	if runtimeShuttingDown then
+		error("TaskRuntime is shut down", 2)
+	end
+
+	local handle = makeHandle("every")
+	local args = pack(...)
+
+	local function repeatCallback(token)
+		local nextRunAt = time() + seconds
+
+		while not token:IsCancelled() do
+			if seconds == 0 then
+				if not token:Wait(0) then
+					break
+				end
+			else
+				local remaining = nextRunAt - time()
+				if remaining > 0 and not token:Wait(remaining) then
+					break
+				end
+				if token:IsCancelled() then
+					break
+				end
+			end
+
+			callback(token, table.unpack(args, 1, args.n))
+			handle.Iterations = handle.Iterations + 1
+
+			if seconds > 0 then
+				nextRunAt = nextRunAt + seconds
+				local now = time()
+				if nextRunAt <= now then
+					local skipped = math.floor((now - nextRunAt) / seconds) + 1
+					handle.SkippedIntervals = handle.SkippedIntervals + skipped
+					nextRunAt = nextRunAt + (skipped * seconds)
+				end
+			end
+		end
+
+		return handle.Iterations
+	end
+
+	spawn(function()
+		runCallback(handle, repeatCallback, pack())
+	end)
+
+	return handle
+end
+
 function TaskRuntime.wait(seconds)
 	assertSeconds(seconds, "TaskRuntime.wait", true)
 	local startedAt = time()
@@ -436,6 +565,10 @@ function CleanupScope.new(name)
 		_keyedEntries = {},
 		_destroyed = false,
 		_cleaning = false,
+		_cleanupComplete = false,
+		_cleanupCallbacks = {},
+		_pendingTasks = {},
+		_pendingScopes = {},
 	}, CleanupScope)
 end
 
@@ -443,8 +576,67 @@ function CleanupScope:IsDestroyed()
 	return self._destroyed
 end
 
+function CleanupScope:IsCleanupComplete()
+	return self._cleanupComplete
+end
+
 function CleanupScope:GetCount()
 	return #self._entries
+end
+
+function CleanupScope:_OnCleanupComplete(callback)
+	assertCallback(callback, "CleanupScope:_OnCleanupComplete")
+	if self._cleanupComplete then
+		callback(self)
+	else
+		table.insert(self._cleanupCallbacks, callback)
+	end
+end
+
+function CleanupScope:_CheckCleanupComplete()
+	if not self._destroyed or self._cleanupComplete then
+		return false
+	end
+	if next(self._pendingTasks) ~= nil or next(self._pendingScopes) ~= nil then
+		return false
+	end
+
+	self._cleanupComplete = true
+	local callbacks = self._cleanupCallbacks
+	self._cleanupCallbacks = {}
+
+	for _, callback in ipairs(callbacks) do
+		local succeeded, callbackError = pcall(callback, self)
+		if not succeeded then
+			warn("[TaskRuntime] scope completion callback failed: " .. tostring(callbackError))
+		end
+	end
+
+	return true
+end
+
+function CleanupScope:_TrackTask(handle)
+	if handle:IsDone() or self._pendingTasks[handle] then
+		return
+	end
+
+	self._pendingTasks[handle] = true
+	handle:_OnFinished(function()
+		self._pendingTasks[handle] = nil
+		self:_CheckCleanupComplete()
+	end)
+end
+
+function CleanupScope:_TrackScope(scope)
+	if scope:IsCleanupComplete() or self._pendingScopes[scope] then
+		return
+	end
+
+	self._pendingScopes[scope] = true
+	scope:_OnCleanupComplete(function()
+		self._pendingScopes[scope] = nil
+		self:_CheckCleanupComplete()
+	end)
 end
 
 function CleanupScope:_DetachEntry(entry)
@@ -568,6 +760,10 @@ function CleanupScope:Delay(seconds, callback, ...)
 	return self:Add(TaskRuntime.delay(seconds, callback, ...), "Cancel")
 end
 
+function CleanupScope:Every(seconds, callback, ...)
+	return self:Add(TaskRuntime.every(seconds, callback, ...), "Cancel")
+end
+
 function CleanupScope:Child(name)
 	return self:Add(CleanupScope.new(name), "Destroy")
 end
@@ -584,11 +780,18 @@ function CleanupScope:Cleanup(reason)
 
 	for index = #entries, 1, -1 do
 		local entry = entries[index]
+		local resource = entry.Resource
 		entry.Active = false
+
+		if getmetatable(resource) == TaskHandle then
+			self:_TrackTask(resource)
+		elseif getmetatable(resource) == CleanupScope then
+			self:_TrackScope(resource)
+		end
 
 		local succeeded, cleanupError = pcall(
 			cleanupResource,
-			entry.Resource,
+			resource,
 			entry.CleanupMethod,
 			reason or (self.Name .. " cleaned up")
 		)
@@ -599,11 +802,39 @@ function CleanupScope:Cleanup(reason)
 
 	self._cleaning = false
 	self._destroyed = true
+	self:_CheckCleanupComplete()
 	return true
 end
 
 function CleanupScope:Destroy(reason)
 	return self:Cleanup(reason or (self.Name .. " destroyed"))
+end
+
+-- Requests cleanup and waits until all directly owned tasks and child scopes have
+-- actually finished. The optional timeout returns false, "timeout" instead of
+-- waiting forever for a non-cooperative task.
+function CleanupScope:DestroyAndAwait(reason, timeoutSeconds)
+	if timeoutSeconds ~= nil then
+		assertSeconds(timeoutSeconds, "CleanupScope:DestroyAndAwait", false)
+	end
+
+	if not self._destroyed then
+		self:Destroy(reason or (self.Name .. " destroyed and awaited"))
+	end
+
+	local deadline = nil
+	if timeoutSeconds ~= nil then
+		deadline = time() + timeoutSeconds
+	end
+
+	while not self:IsCleanupComplete() do
+		if deadline ~= nil and time() >= deadline then
+			return false, "timeout"
+		end
+		wait(0)
+	end
+
+	return true
 end
 
 function CleanupScope:_Dispose()
@@ -616,6 +847,7 @@ end
 
 TaskRuntime.Handle = TaskHandle
 TaskRuntime.CancellationToken = CancellationToken
+TaskRuntime.CancellationConnection = CancellationConnection
 TaskRuntime.CleanupScope = CleanupScope
 
 return TaskRuntime
