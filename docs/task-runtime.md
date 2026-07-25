@@ -1,33 +1,68 @@
 # TaskRuntime
 
-`TaskRuntime` is a structured asynchronous task and cleanup library for Polytoria Luau. It combines cancellable scheduling, bounded waiting, retries, task composition, runtime diagnostics, and deterministic resource cleanup.
+`TaskRuntime` is an asynchronous task and cleanup library for Polytoria Luau. It provides scheduling, cooperative cancellation, task composition, lifecycle scopes, bounded concurrency, cleanup deadlines, diagnostics, and deterministic virtual-time testing.
+
+Current version:
+
+```text
+3.0.0
+```
 
 ## Why this is needed
 
-Most game systems have a lifecycle. A round starts and ends. A player joins and leaves. A vehicle is spawned and destroyed. During that lifecycle, scripts often create delayed callbacks, repeating loops, signal connections, temporary instances, and child systems.
+Most game systems create work that should only exist for part of the game session. Examples include:
 
-Without lifecycle ownership, old work can outlive the system that created it. Common results include:
+- round timers
+- player autosaves
+- vehicle update loops
+- temporary effects
+- signal connections
+- delayed callbacks
+- background requests
+- child systems
 
-- an old timer affecting a new round
-- duplicate signal callbacks after a restart
-- loops continuing after a player or vehicle is gone
-- temporary instances remaining referenced
-- old and new versions of a system running together
-- increasing CPU work, memory use, and network traffic
-- shutdown code that sometimes works and sometimes leaks
+Without explicit ownership, old work can continue after the system that created it has ended. This can cause duplicate callbacks, stale timers, memory retention, extra physics work, repeated saves, and old systems interfering with new ones.
 
-`TaskRuntime` gives each system an explicit cleanup scope. Everything registered with that scope can be cancelled, disconnected, destroyed, or otherwise cleaned when the system ends.
+`TaskRuntime` gives that work an owner and a clear stopping path.
 
-A scope only manages resources registered with it. Raw `spawn`, raw signal connections, and unregistered objects still require manual cleanup.
+## What happens without it
+
+Consider a round script that creates a delayed callback and a player connection every time a round starts. If the round restarts without cleaning those resources, every old callback and connection can remain active.
+
+After several rounds, one player join may trigger several handlers and several old timers may end the wrong round. The bug appears to be random, but the actual cause is work surviving past its intended lifecycle.
+
+A cleanup scope prevents that:
+
+```luau
+local roundScope = TaskRuntime.scope("Round")
+
+roundScope:Delay(60, function(token)
+	endRound()
+end)
+
+roundScope:Connect(game["Players"].PlayerAdded, function(player)
+	print(player.Name, "joined")
+end)
+
+function stopRound()
+	roundScope:Destroy("round ended")
+end
+```
+
+Destroying the scope cancels the timer and disconnects the signal.
 
 ## Project files
 
-- `scripts/modules/TaskRuntime.luau`: reusable ModuleScript
-- `scripts/server/script.server.luau`: root server lifecycle example
+- `scripts/modules/TaskRuntime.luau`: runtime module
+- `scripts/modules/TaskRuntimeTypes.luau`: optional exported Luau types
+- `scripts/server/script.server.luau`: server root example
 - `scripts/tests/task-runtime-test.server.luau`: Creator self-test
-- `docs/task-runtime-examples.md`: copy-paste usage examples
+- `docs/task-runtime.md`: main documentation
+- `docs/task-runtime-examples.md`: copy-paste examples
 
-In Creator, link `scripts/modules/TaskRuntime.luau` to a `ModuleScript` named `TaskRuntime` under `ScriptService`.
+## Creator setup
+
+Link `scripts/modules/TaskRuntime.luau` to a `ModuleScript` named `TaskRuntime` under `ScriptService`.
 
 ```text
 ScriptService
@@ -36,56 +71,57 @@ ScriptService
 └── task-runtime-test
 ```
 
-Load it with:
+Load the module with:
 
 ```luau
 local TaskRuntime = require(game["ScriptService"]["TaskRuntime"])
 ```
 
-## Quick start
-
-Create one scope for a system, register temporary work, then destroy the scope when the system ends.
+Check the installed version with:
 
 ```luau
-local TaskRuntime = require(game["ScriptService"]["TaskRuntime"])
-local roundScope = TaskRuntime.scope("Round")
-
-roundScope:Delay(60, function(token)
-	if token:IsCancelled() then
-		return
-	end
-	endRound()
-end)
-
-roundScope:Connect(game["Players"].PlayerAdded, function(player)
-	print(player.Name .. " joined during the round")
-end)
-
-function stopRound()
-	roundScope:Destroy("round ended")
-end
+print(TaskRuntime.VERSION)
 ```
 
-When `stopRound()` runs, the pending timer is cancelled and the signal connection is disconnected.
+## Compatibility
 
-More complete patterns are available in [TaskRuntime examples](task-runtime-examples.md).
+The existing APIs remain available:
 
-## Task model
+```luau
+TaskRuntime.spawn(callback, ...)
+TaskRuntime.defer(callback, ...)
+TaskRuntime.delay(seconds, callback, ...)
+TaskRuntime.every(seconds, callback, ...)
+TaskRuntime.wait(seconds?)
+TaskRuntime.scope(name?, options?)
+```
 
-Every scheduled callback receives a `CancellationToken` as its first argument. Extra arguments follow the token.
+Existing task handles still support:
+
+```luau
+handle:Cancel(reason?)
+handle:Await(timeoutSeconds?)
+handle:IsDone()
+handle:IsCancelled()
+```
+
+## Task callback convention
+
+Every scheduled callback receives a `CancellationToken` as its first argument. Extra arguments follow it.
 
 ```luau
 local task = TaskRuntime.spawn(function(token, left, right)
 	if token:IsCancelled() then
-		return nil
+		return
 	end
+
 	return left + right
 end, 2, 3)
-
-local success, value = task:Await()
 ```
 
-Task states are:
+## Task states
+
+A task can be in one of these states:
 
 - `scheduled`
 - `running`
@@ -94,36 +130,64 @@ Task states are:
 - `cancelled`
 - `failed`
 
-Pending tasks cancel immediately. Running callbacks use cooperative cancellation. They enter `cancelling` and remain active until their code exits.
+Pending tasks cancel immediately. Running callbacks use cooperative cancellation. A running callback enters `cancelling` and remains active until its code exits.
 
 ## Scheduling
 
+### Run immediately
+
 ```luau
-TaskRuntime.spawn(callback, ...)
-TaskRuntime.defer(callback, ...)
-TaskRuntime.delay(seconds, callback, ...)
-TaskRuntime.every(seconds, callback, ...)
+local task = TaskRuntime.spawn(function(token)
+	return loadPlayerData()
+end)
 ```
 
-`every()` waits one interval before its first run. Iterations never overlap. When a callback takes longer than its interval, missed intervals are counted in `SkippedIntervals` and skipped instead of replayed in a burst.
+### Run on a later scheduler step
 
-Passing `0` to `every()` runs once per physics frame. Keep frame-based callbacks small.
+```luau
+TaskRuntime.defer(function(token)
+	initializeAfterStartup()
+end)
+```
+
+### Run after a delay
+
+```luau
+TaskRuntime.delay(5, function(token)
+	print("Five seconds passed")
+end)
+```
+
+### Repeat without overlap
+
+```luau
+local heartbeat = TaskRuntime.every(10, function(token)
+	saveDirtyProfiles()
+end)
+```
+
+The first run happens after one interval. Repeating callbacks never overlap. If a callback takes longer than its interval, missed runs are counted in `SkippedIntervals` and skipped instead of replayed in a burst.
 
 ## Cancellation
+
+### Cancel a task
+
+```luau
+worker:Cancel("system ended")
+```
+
+### Check cancellation inside a callback
 
 ```luau
 local worker = TaskRuntime.spawn(function(token)
 	while not token:IsCancelled() do
-		performOneWorkStep()
+		performOneStep()
 		TaskRuntime.wait(0)
 	end
 end)
-
-worker:Cancel("system ended")
-worker:Await()
 ```
 
-For cancellable waits inside a task:
+### Wait while remaining cancellable
 
 ```luau
 if not token:Wait(5) then
@@ -131,21 +195,23 @@ if not token:Wait(5) then
 end
 ```
 
-Immediate cancellation callbacks:
+### React immediately to cancellation
 
 ```luau
 local connection = token:OnCancel(function(reason)
-	print("Stopping because:", reason)
+	print("Stopping:", reason)
 end)
-
-connection:Disconnect()
 ```
 
-`token:ThrowIfCancelled()` raises the cancellation reason when returning manually would make the code harder to read.
+### Throw when cancelled
+
+```luau
+token:ThrowIfCancelled()
+```
 
 ## Cancellation sources
 
-A cancellation source is useful when several pieces of work should share one signal without belonging to a single task.
+A cancellation source lets several operations share one cancellation signal.
 
 ```luau
 local source = TaskRuntime.cancellationSource()
@@ -153,14 +219,14 @@ local source = TaskRuntime.cancellationSource()
 TaskRuntime.spawn(function(token)
 	while not source.Token:IsCancelled() do
 		performBackgroundWork()
-		TaskRuntime.wait(0)
+		source.Token:Wait(1)
 	end
 end)
 
-source:Cancel("system stopped")
+source:Cancel("feature disabled")
 ```
 
-Link a source to a parent token:
+Link a child source to a parent token:
 
 ```luau
 local childSource = TaskRuntime.cancellationSource(parentToken)
@@ -168,67 +234,138 @@ local childSource = TaskRuntime.cancellationSource(parentToken)
 
 Cancelling the parent cancels the child source with the same reason.
 
-## Bounded waiting and timeouts
+## Waiting and outcomes
 
-`Await(timeoutSeconds?)` can stop waiting without cancelling the task.
+### Await a result
 
 ```luau
-local success, result = task:Await(2)
-if not success and result == "timeout" then
-	warn("Task is still running")
+local success, value = task:Await(5)
+```
+
+`Await(5)` stops waiting after five seconds. It does not cancel the task.
+
+### Read a structured outcome
+
+```luau
+local outcome = task:AwaitOutcome(5)
+
+if outcome.Status == "completed" then
+	print(outcome.Values[1])
+elseif outcome.Status == "failed" then
+	print(outcome.Error.Code, outcome.Error.Message)
+elseif outcome.Status == "cancelled" then
+	print(outcome.CancellationReason)
+elseif outcome.Status == "timeout" then
+	print("The task is still running")
 end
 ```
 
-Use `CancelAfter()` when the deadline should request cancellation:
+Possible outcome statuses include:
+
+- `completed`
+- `failed`
+- `cancelled`
+- `timeout`
+
+### Read an outcome without waiting
 
 ```luau
-worker:CancelAfter(5, "worker deadline")
+if task:IsDone() then
+	local outcome = task:GetOutcome()
+end
 ```
 
-Or create the task with a timeout:
+## Structured errors
+
+Failed tasks expose both compatibility and structured fields:
+
+```luau
+print(task.Error)
+print(task.ErrorInfo.Code)
+print(task.ErrorInfo.Message)
+print(task.ErrorInfo.TaskId)
+print(task.ErrorInfo.TaskName)
+print(task.ErrorInfo.TaskKind)
+print(task.ErrorInfo.ParentTaskId)
+print(task.ErrorInfo.ScopeName)
+```
+
+Common error codes include:
+
+- `CALLBACK_FAILED`
+- `AWAIT_TIMEOUT`
+- `CHILD_TASK_FAILED`
+- `RACE_WINNER_FAILED`
+- `ALL_TASKS_FAILED`
+- `CLEANUP_FAILED`
+- `CLEANUP_TIMEOUT`
+- `SCOPE_CLEANUP_TIMEOUT`
+
+## Deadlines
+
+### Cancel after a deadline
+
+```luau
+local deadline = worker:CancelAfter(5, "worker deadline")
+```
+
+The returned deadline handle supports:
+
+```luau
+deadline:Cancel()
+deadline:Disconnect()
+deadline:Destroy()
+```
+
+### Create a task with a timeout
 
 ```luau
 local worker = TaskRuntime.withTimeout(5, function(token)
 	while not token:IsCancelled() do
-		performOneWorkStep()
-		TaskRuntime.wait(0)
+		performOneStep()
+		token:Wait(0)
 	end
 end)
 ```
 
-Timeout cancellation is cooperative. Code that ignores its token can continue running.
+Timeout cancellation remains cooperative. A callback that ignores its token can continue running.
 
-## Completion observers
+## Completion chains
 
-`OnComplete()` reacts to completion without blocking.
+### Then
+
+Run a callback after successful completion:
 
 ```luau
-local connection = task:OnComplete(function(handle)
-	print(handle.Name, handle.State)
+local finalTask = loadTask:Then(function(token, profile)
+	return buildInventory(profile)
 end)
 ```
 
-The callback runs once. Registering after completion invokes it immediately and returns a disconnected connection.
+### Catch
 
-## Names, metadata, and timing
+Recover from a failed or cancelled source task:
 
 ```luau
-local task = TaskRuntime.spawn(function(token)
-	loadInventory()
+local recovered = requestTask:Catch(function(token, taskError, cancellationReason, outcome)
+	warn(taskError and taskError.Message or cancellationReason)
+	return defaultValue
 end)
-
-task:SetName("LoadInventory")
-task:SetMetadata("playerID", player.UserID)
-
-print(task:GetMetadata("playerID"))
-print(task:GetElapsedTime())
 ```
 
-Names and metadata appear in runtime snapshots.
+### Finally
+
+Run cleanup or logging after any terminal state:
+
+```luau
+local observed = task:Finally(function(token, outcome)
+	print("Task finished with", outcome.Status)
+end)
+```
+
+Each method returns a new `TaskHandle`.
 
 ## Retries
-
-`retry()` reruns callbacks that throw. The callback receives the token, attempt number, then the original arguments.
 
 ```luau
 local request = TaskRuntime.retry(4, function(token, attempt, playerID)
@@ -237,6 +374,7 @@ end, {
 	delaySeconds = 0.25,
 	backoffFactor = 2,
 	maxDelaySeconds = 2,
+	jitter = 0.1,
 	shouldRetry = function(message, attempt)
 		return string.find(message, "temporary", 1, true) ~= nil
 	end,
@@ -244,27 +382,25 @@ end, {
 		warn("Retrying", attempt, nextDelay, message)
 	end,
 }, player.UserID)
-
-local success, profile = request:Await(10)
 ```
 
-A normal return is successful. Throw an error to request another attempt.
+The callback receives:
+
+```text
+token, attemptNumber, ...originalArguments
+```
+
+A normal return succeeds. Throw an error to request another attempt.
 
 ## Task composition
 
-### Wait for all tasks
+Composition is event-driven. Child completion callbacks wake the aggregate instead of each aggregate checking every physics frame.
 
-`TaskRuntime.all()` is fail-fast by default. A successful aggregate returns packed result arrays in input order.
+### all
+
+Wait for every task and preserve input order:
 
 ```luau
-local profileTask = TaskRuntime.spawn(function(token)
-	return getProfile()
-end)
-
-local inventoryTask = TaskRuntime.spawn(function(token)
-	return getInventory()
-end)
-
 local group = TaskRuntime.all({ profileTask, inventoryTask })
 local success, results = group:Await(5)
 
@@ -274,16 +410,143 @@ if success then
 end
 ```
 
-A failed or cancelled child fails the aggregate and cancels unfinished siblings. Pass `{ failFast = false }` to receive a structured outcome for every task.
+By default, one failed or cancelled child fails the group and cancels unfinished siblings.
 
-### Use the first completed task
+### settle
+
+Wait for every task and receive every outcome:
 
 ```luau
-local race = TaskRuntime.race({ primaryRequest, fallbackRequest })
+local group = TaskRuntime.settle({ firstTask, secondTask })
+local success, outcomes = group:Await(5)
+
+for _, outcome in ipairs(outcomes) do
+	print(outcome.Status)
+end
+```
+
+### race
+
+Use the first terminal task:
+
+```luau
+local race = TaskRuntime.race({ primaryTask, fallbackTask })
 local success, winnerIndex, value = race:Await(3)
 ```
 
-The unfinished losers are cancelled by default. Both composition functions support `cancelRemaining` and `cancelOnCancel` options.
+The unfinished losers are cancelled by default.
+
+### any
+
+Use the first successful task:
+
+```luau
+local any = TaskRuntime.any({ cacheTask, networkTask, fallbackTask })
+local success, winnerIndex, value = any:Await(3)
+```
+
+Failed children are ignored until one task succeeds or every task fails.
+
+## Mapping and bounded concurrency
+
+### Map every item
+
+```luau
+local mapped = TaskRuntime.map(items, function(token, item, index)
+	return processItem(item)
+end)
+```
+
+### Limit simultaneous work
+
+```luau
+local mapped = TaskRuntime.mapLimit(items, 4, function(token, item, index)
+	return processItem(item)
+end)
+```
+
+Only four callbacks can hold a permit at one time.
+
+## Semaphores
+
+```luau
+local semaphore = TaskRuntime.semaphore(3)
+
+local acquired, reason = semaphore:Acquire(token, 2)
+if not acquired then
+	return
+end
+
+local succeeded, result = pcall(doExpensiveWork)
+semaphore:Release()
+
+if not succeeded then
+	error(result)
+end
+```
+
+Useful methods:
+
+```luau
+semaphore:GetWaitingCount()
+semaphore:Acquire(token?, timeoutSeconds?)
+semaphore:Release(count?)
+semaphore:WithPermit(token?, callback, timeoutSeconds?, ...)
+```
+
+## Task queues
+
+```luau
+local queue = TaskRuntime.queue(3, {
+	name = "ProfileSaves",
+})
+
+local saveTask = queue:Add(function(token, player)
+	return savePlayer(player)
+end, player)
+```
+
+Only three queued callbacks run at once.
+
+```luau
+queue:GetActiveCount()
+queue:Close("server shutdown")
+```
+
+A queue can be registered with a cleanup scope:
+
+```luau
+local queue = TaskRuntime.queue(3, {
+	name = "ProfileSaves",
+	scope = serverScope,
+})
+```
+
+## Debounce and throttle
+
+### Debounce
+
+Cancel previous pending work with the same key:
+
+```luau
+TaskRuntime.debounce(player.UserID, 0.5, function(token)
+	savePlayer(player)
+end)
+```
+
+### Throttle
+
+Allow one leading call per time window:
+
+```luau
+local task, activeTask = TaskRuntime.throttle(player.UserID, 1, function(token)
+	sendPositionUpdate(player)
+end)
+
+if task == nil then
+	print("Suppressed. Existing task:", activeTask)
+end
+```
 
 ## Cleanup scopes
 
@@ -293,161 +556,299 @@ A scope can own:
 - repeating tasks
 - signal connections
 - child scopes
-- instances and other objects
+- queues
+- instances
+- cancellation sources
 - custom cleanup callbacks
 
-Cleanup runs in reverse registration order.
+Cleanup uses reverse registration order.
 
 ```luau
-local scope = TaskRuntime.scope("Boat")
+local scope = TaskRuntime.scope("Vehicle")
 
-scope:Spawn(function(token)
-	while not token:IsCancelled() do
-		updateBoatPhysics()
-		TaskRuntime.wait(0)
-	end
+scope:Every(0, function(token)
+	updateVehicle()
 end)
 
-scope:Connect(boat.Destroying, function()
-	scope:Destroy("boat removed")
-end)
+scope:Add(vehicleModel, "Destroy")
 
 scope:Add(function(reason)
-	resetBoatForces(boat)
+	resetVehicleForces()
 end)
 ```
 
-When no cleanup method is supplied, a scope checks for these methods in order:
+### Named resources
 
-1. `Cancel`
-2. `Disconnect`
-3. `Cleanup`
-4. `Destroy`
-5. `Close`
-
-You can provide an explicit method:
+Replace one resource without destroying the entire scope:
 
 ```luau
-scope:Add(temporaryPart, "Destroy")
-```
-
-## Named resources
-
-Named resources allow one item to be replaced without destroying the entire scope.
-
-```luau
-roundScope:Set("RoundTimer", TaskRuntime.delay(60, function(token)
-	endRound()
-end))
-
-roundScope:Set("RoundTimer", TaskRuntime.delay(90, function(token)
-	endRound()
+scope:Set("RespawnTimer", TaskRuntime.delay(10, function(token)
+	respawnPlayer()
 end))
 ```
 
-The second `Set` cancels and replaces the first timer.
+Replacing the same key cleans the previous resource first.
 
 ```luau
-local timer = roundScope:Get("RoundTimer")
-local exists = roundScope:Has("RoundTimer")
-roundScope:Remove("RoundTimer")
+scope:Get("RespawnTimer")
+scope:Has("RespawnTimer")
+scope:Remove("RespawnTimer")
 ```
 
-`Remove` cleans by default. Pass `false` as the second argument to detach without cleaning.
-
-## Child scopes
+### Per-resource cleanup options
 
 ```luau
-local matchScope = TaskRuntime.scope("Match")
-local roundScope = matchScope:Child("Round")
-local effectsScope = roundScope:Child("Effects")
+scope:Add(resource, {
+	method = "Destroy",
+	name = "TemporaryMap",
+	timeout = 1,
+})
 ```
 
-Destroying `matchScope` also destroys both child scopes.
+The older form still works:
 
-Completed tasks and completed child scopes automatically detach from long-lived parents, preventing stale references.
+```luau
+scope:Add(resource, "Destroy")
+```
+
+## Cleanup deadlines
+
+Configure deadlines when one cleanup operation must not block the rest:
+
+```luau
+local scope = TaskRuntime.scope("Server", {
+	cleanupTimeout = 5,
+	resourceCleanupTimeout = 1,
+})
+```
+
+A resource can override the default:
+
+```luau
+scope:Add(cache, {
+	method = "Close",
+	name = "ProfileCache",
+	timeout = 2,
+})
+```
+
+Timed-out cleanup is recorded while later resources continue cleaning.
+
+```luau
+local success, reason, errors = scope:DestroyAndAwait("shutdown", 6)
+```
+
+Possible cleanup codes include:
+
+- `CLEANUP_FAILED`
+- `CLEANUP_TIMEOUT`
+- `CLEANUP_CANCELLED`
+- `SCOPE_CLEANUP_TIMEOUT`
+- `CHILD_CLEANUP_FAILED`
+
+A timed-out callback cannot be forcefully terminated. Cancellation remains cooperative.
+
+## Task contexts
+
+A task context owns all work created through it. When the root callback exits, child work is cancelled and awaited.
+
+```luau
+local systemScope = TaskRuntime.scope("InventorySystem")
+
+local rootTask = systemScope:Run(function(context, token, player)
+	context:Every(30, function(childToken)
+		saveInventory(player)
+	end)
+
+	context:Spawn(function(childToken)
+		watchInventoryChanges(player, childToken)
+	end)
+
+	return loadInventory(player)
+end, {
+	name = "InventoryRoot",
+	cancelOnChildFailure = true,
+	childShutdownTimeout = 5,
+}, player)
+```
+
+Context-created tasks inherit:
+
+- parent cancellation
+- parent task ID in diagnostics
+- child scope ownership
+- optional child failure cancellation
+
+Context methods include:
+
+```luau
+context:Spawn(...)
+context:Defer(...)
+context:Delay(...)
+context:Every(...)
+context:WithTimeout(...)
+context:Retry(...)
+context:Child(...)
+context:Cancel(...)
+context:Close(...)
+```
 
 ## Scope supervision
 
-A supervising scope can shut down its remaining resources when an owned task fails.
+A scope can stop its remaining resources when an owned task fails:
 
 ```luau
-local systemScope = TaskRuntime.scope("InventorySystem", {
+local scope = TaskRuntime.scope("CriticalSystem", {
 	cancelOnTaskFailure = true,
 })
-
-systemScope:Spawn(function(token)
-	runInventoryWorker(token)
-end):SetName("InventoryWorker")
 ```
 
-Use `GetTaskFailures()` to inspect recorded failures.
-
-## Cleanup errors
-
-Cleanup continues after an individual resource fails. Every failure is recorded and sent to the cleanup error handler.
+Inspect failures with:
 
 ```luau
-TaskRuntime.setCleanupErrorHandler(function(message, scope, record)
-	warn("Cleanup failure", scope.Name, message)
-end)
+local failures = scope:GetTaskFailures()
 ```
-
-`DestroyAndAwait()` reports cleanup errors:
-
-```luau
-local success, reason, errors = scope:DestroyAndAwait("system stopped", 5)
-```
-
-When errors exist, it returns `false`, `"cleanup failed"`, and the error records. Use `GetCleanupErrors()` and `HasCleanupErrors()` to inspect them later.
-
-## Destroy versus DestroyAndAwait
-
-Use `Destroy()` to request cleanup without waiting:
-
-```luau
-scope:Destroy("boat removed")
-```
-
-Use `DestroyAndAwait()` when the next action must not begin until all owned tasks and child scopes have stopped:
-
-```luau
-local success, reason = scope:DestroyAndAwait("round ended", 5)
-```
-
-A timeout is recommended for shutdown paths. Do not call `DestroyAndAwait()` from a task owned by the same scope because that task would wait for itself.
 
 ## Runtime diagnostics
 
+### Active snapshot
+
 ```luau
 local snapshot = TaskRuntime.getSnapshot()
-print("Active tasks:", snapshot.ActiveCount)
 
-for kind, count in pairs(snapshot.ByKind) do
-	print(kind, count)
-end
-
-for _, task in ipairs(snapshot.Tasks) do
-	print(task.Id, task.Name, task.State, task.Age)
-end
+print(snapshot.Version)
+print(snapshot.ActiveCount)
+print(snapshot.PeakActiveCount)
+print(snapshot.PendingDeadlines)
 ```
 
-Other helpers:
+Each active task includes:
+
+- ID
+- name
+- kind
+- state
+- age
+- elapsed time
+- iteration count
+- skipped interval count
+- metadata
+- parent task ID
+- owning scope
+- deadline
+- optional creation trace
+
+### Completed history
 
 ```luau
-TaskRuntime.getActiveCount()
-TaskRuntime.getActiveCount("retry")
-TaskRuntime.getActiveTasks()
+local history = TaskRuntime.getHistory()
+```
+
+History uses a bounded buffer.
+
+### Aggregated statistics
+
+```luau
+local stats = TaskRuntime.getStats()
+local saveStats = stats.SavePlayer
+
+print(saveStats.Count)
+print(saveStats.Completed)
+print(saveStats.Failed)
+print(saveStats.Cancelled)
+print(saveStats.AverageDuration)
+print(saveStats.MaxDuration)
+```
+
+### Configure diagnostics
+
+```luau
+TaskRuntime.configureDiagnostics({
+	historySize = 200,
+	captureCreationTrace = false,
+})
+```
+
+Creation traces are optional because they add work and memory use.
+
+### Warn about long-running work
+
+```luau
 TaskRuntime.warnLongRunning(10)
 ```
 
-## Error handling
+## Runtime instances
 
-Task callbacks run through `pcall`. Failed tasks enter `failed`, store their error in `handle.Error`, and invoke the global error handler.
+The module exports one default runtime, but isolated runtimes can also be created:
 
 ```luau
-TaskRuntime.setErrorHandler(function(message, handle)
-	warn("Task failed", handle.Id, handle.Name, message)
+local runtime = TaskRuntime.create({
+	historySize = 50,
+})
+
+local task = runtime:spawn(function(token)
+	return 10
+end)
+```
+
+Do not combine task handles from different runtime instances in `all`, `race`, `any`, or `settle`.
+
+## Virtual-time testing
+
+`TestScheduler` lets tests advance time without waiting in real time.
+
+```luau
+local scheduler = TaskRuntime.TestScheduler.new(0)
+local runtime = TaskRuntime.create({
+	scheduler = scheduler,
+})
+
+local delayed = runtime:delay(3600, function(token)
+	return "one hour"
+end)
+
+scheduler:Advance(3600)
+
+local success, value = delayed:Await()
+```
+
+Useful scheduler methods:
+
+```luau
+scheduler:Now()
+scheduler:Spawn(callback)
+scheduler:Sleep(seconds)
+scheduler:Advance(seconds)
+scheduler:RunReady()
+scheduler:RunUntilIdle()
+scheduler:GetErrors()
+```
+
+The Creator self-test remains the engine integration test. Virtual time is for deterministic module tests.
+
+## Optional type definitions
+
+`TaskRuntimeTypes.luau` exports types for editor tooling:
+
+```luau
+local TaskRuntime = require(game["ScriptService"]["TaskRuntime"])
+local TaskRuntimeTypes = require(game["ScriptService"]["TaskRuntimeTypes"])
+
+type TaskHandle = TaskRuntimeTypes.TaskHandle
+type TaskOutcome = TaskRuntimeTypes.TaskOutcome
+```
+
+The runtime module remains usable without the type module.
+
+## Error handlers
+
+```luau
+TaskRuntime.setErrorHandler(function(message, handle, taskError)
+	warn(handle.Name, taskError.Code, message)
+end)
+
+TaskRuntime.setCleanupErrorHandler(function(message, scope, record)
+	warn(scope.Name, record.Code, message)
 end)
 ```
 
@@ -458,33 +859,21 @@ TaskRuntime.setErrorHandler(nil)
 TaskRuntime.setCleanupErrorHandler(nil)
 ```
 
-## Common use cases
-
-TaskRuntime is especially useful for:
-
-- round and match lifecycles
-- player-specific workers and autosaves
-- vehicle controllers
-- temporary effects
-- replaceable cooldowns
-- server maintenance loops
-- network request deadlines
-- parallel loading operations
-- external calls that need retries
-- systems that must shut down after one worker fails
-
-## Root script lifecycle
+## Root server lifecycle
 
 ```luau
 local TaskRuntime = require(game["ScriptService"]["TaskRuntime"])
-local rootScope = TaskRuntime.scope("ServerRoot")
+local rootScope = TaskRuntime.scope("ServerRoot", {
+	cleanupTimeout = 5,
+	resourceCleanupTimeout = 1,
+})
 
 function Shutdown()
-	rootScope:Destroy("server root shutdown")
+	rootScope:Destroy("server shutdown")
 end
 
 function ShutdownAndAwait()
-	return rootScope:DestroyAndAwait("server root shutdown", 5)
+	return rootScope:DestroyAndAwait("server shutdown", 6)
 end
 
 function _Dispose()
@@ -492,13 +881,11 @@ function _Dispose()
 end
 ```
 
-The current game runtime does not automatically invoke `_Dispose()`. Call `Shutdown()` or `ShutdownAndAwait()` explicitly through `BaseScript:Call()`.
-
-Use `TaskRuntime.shutdown()` only when the entire runtime is ending. It cancels every active task and prevents new tasks from being scheduled for the rest of that session.
+Use `TaskRuntime.shutdown()` only when the entire runtime is ending. It cancels every active task and prevents new work from being scheduled during that session.
 
 ## Testing in Creator
 
-The linked test is:
+Link this file to a temporary `ServerScript`:
 
 ```text
 scripts/tests/task-runtime-test.server.luau
@@ -510,31 +897,33 @@ Start a normal local playtest. A successful run prints:
 TaskRuntime self-test passed
 ```
 
-The self-test covers normal execution and intentional failure paths, including:
+The test covers:
 
-- argument and result forwarding
-- pending and cooperative cancellation
-- cancellation and completion observers
-- bounded waits and timeouts
-- linked cancellation sources
-- retry policies and backoff
-- `all()` and `race()` behavior
-- automatic scope detachment
-- named-resource replacement
-- non-overlapping repeating tasks
-- recursive awaited cleanup
-- reverse cleanup order
-- supervising scopes
-- cleanup error aggregation
-- diagnostic snapshots
-- active-task release
+- scheduling and results
+- cooperative cancellation
+- deadlines and timeout outcomes
+- structured errors
+- completion chains
+- retries
+- `all`, `settle`, `race`, and `any`
+- semaphores and queues
+- `mapLimit`
+- debounce and throttle
+- task contexts
+- cleanup deadlines
+- diagnostics and history
+- virtual-time scheduling
+- unknown option validation
+- active task release
 
-Disable or remove the test `ServerScript` after verification so it does not run during ordinary development.
+Remove or disable the test script after verification.
 
 ## API reference
 
-### TaskRuntime
+### TaskRuntime and Runtime
 
+- `VERSION`
+- `create(options?)`
 - `spawn(callback, ...)`
 - `defer(callback, ...)`
 - `delay(seconds, callback, ...)`
@@ -542,35 +931,33 @@ Disable or remove the test `ServerScript` after verification so it does not run 
 - `withTimeout(seconds, callback, ...)`
 - `retry(attemptCount, callback, options?, ...)`
 - `all(handles, options?)`
+- `settle(handles)`
 - `race(handles, options?)`
+- `any(handles, options?)`
+- `map(items, callback, options?)`
+- `mapLimit(items, concurrency, callback, options?)`
 - `wait(seconds?)`
 - `cancel(handle, reason?)`
 - `isCancelled(handle)`
 - `isDone(handle)`
+- `semaphore(limit)`
+- `queue(concurrency, options?)`
+- `debounce(key, seconds, callback, ...)`
+- `throttle(key, seconds, callback, ...)`
+- `scope(name?, options?)`
+- `context(name?, options?)`
 - `getActiveCount(kind?)`
 - `getActiveTasks()`
 - `getSnapshot()`
+- `getHistory()`
+- `getStats()`
+- `configureDiagnostics(options?)`
 - `warnLongRunning(thresholdSeconds)`
 - `setErrorHandler(handler?)`
 - `setCleanupErrorHandler(handler?)`
+- `setWarningHandler(handler?)`
 - `cancellationSource(parentToken?)`
 - `shutdown(reason?)`
-- `scope(name?, options?)`
-
-### CancellationToken
-
-- `IsCancelled()`
-- `GetReason()`
-- `Wait(seconds, pollInterval?)`
-- `OnCancel(callback)`
-- `ThrowIfCancelled()`
-
-### CancellationSource
-
-- `Cancel(reason?)`
-- `IsCancelled()`
-- `Destroy(reason?)`
-- `Token`
 
 ### TaskHandle
 
@@ -578,6 +965,7 @@ Disable or remove the test `ServerScript` after verification so it does not run 
 - `SetMetadata(key, value)`
 - `GetMetadata(key)`
 - `GetElapsedTime()`
+- `GetOutcome()`
 - `Cancel(reason?)`
 - `CancelAfter(seconds, reason?)`
 - `IsCancelled()`
@@ -585,11 +973,23 @@ Disable or remove the test `ServerScript` after verification so it does not run 
 - `IsDone()`
 - `OnComplete(callback)`
 - `Await(timeoutSeconds?)`
+- `AwaitOutcome(timeoutSeconds?)`
+- `Then(callback)`
+- `Catch(callback)`
+- `Finally(callback)`
+
+### CancellationToken
+
+- `IsCancelled()`
+- `GetReason()`
+- `ThrowIfCancelled()`
+- `OnCancel(callback)`
+- `Wait(seconds)`
 
 ### CleanupScope
 
-- `Add(resource, cleanupMethod?)`
-- `Set(key, resource, cleanupMethod?)`
+- `Add(resource, cleanupMethod?, options?)`
+- `Set(key, resource, cleanupMethod?, options?)`
 - `Get(key)`
 - `Has(key)`
 - `Remove(key, shouldCleanup?, reason?)`
@@ -601,6 +1001,7 @@ Disable or remove the test `ServerScript` after verification so it does not run 
 - `WithTimeout(seconds, callback, ...)`
 - `Retry(attemptCount, callback, options?, ...)`
 - `Child(name?, options?)`
+- `Run(callback, options?, ...)`
 - `GetCount()`
 - `GetTaskFailures()`
 - `GetCleanupErrors()`

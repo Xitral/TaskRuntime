@@ -1,14 +1,14 @@
 # TaskRuntime Examples
 
-This guide contains copy-paste patterns for common Polytoria systems. The function names such as `savePlayer`, `updateBoatPhysics`, and `loadProfile` represent your own game code.
+This guide contains copy-paste patterns for common Polytoria systems. Replace placeholder functions such as `savePlayer`, `loadProfile`, and `updateBoatPhysics` with your own game code.
 
-All examples assume `TaskRuntime` is linked as a `ModuleScript` named `TaskRuntime` under `ScriptService`:
+All examples assume:
 
 ```luau
 local TaskRuntime = require(game["ScriptService"]["TaskRuntime"])
 ```
 
-## Run work immediately
+## 1. Run work immediately
 
 ```luau
 local task = TaskRuntime.spawn(function(token)
@@ -22,7 +22,7 @@ if success then
 end
 ```
 
-## Pass arguments and return multiple values
+## 2. Pass arguments and return multiple values
 
 ```luau
 local calculation = TaskRuntime.spawn(function(token, left, right)
@@ -36,458 +36,527 @@ if success then
 end
 ```
 
-## Run on a later frame
-
-Use `defer` when work should happen after the current callback yields.
+## 3. Run work later
 
 ```luau
 TaskRuntime.defer(function(token)
-	print("Runs on a later frame")
+	print("Runs on a later scheduler step")
 end)
 ```
 
-## Run after a delay
+## 4. Run after a delay
 
 ```luau
-local delayedMessage = TaskRuntime.delay(5, function(token)
-	print("Five seconds passed")
+local reminder = TaskRuntime.delay(10, function(token, player)
+	showReminder(player)
+end, player)
+```
+
+## 5. Cancel a pending delay
+
+```luau
+local delayedExplosion = TaskRuntime.delay(5, function(token)
+	explodeBomb()
+end)
+
+delayedExplosion:Cancel("bomb defused")
+```
+
+## 6. Repeat without overlap
+
+```luau
+local autosave = TaskRuntime.every(30, function(token)
+	saveDirtyProfiles()
 end)
 ```
 
-Cancel it before it runs:
+## 7. Run once per physics frame
 
 ```luau
-delayedMessage:Cancel("message no longer needed")
-```
-
-## Wait inside a cancellable task
-
-Use `token:Wait()` instead of a raw wait when cancellation should interrupt the delay.
-
-```luau
-local worker = TaskRuntime.spawn(function(token)
-	if not token:Wait(10) then
-		return
-	end
-
-	print("The task was not cancelled")
-end)
-
-worker:Cancel("system stopped")
-```
-
-## Repeat work on an interval
-
-```luau
-local autosave = TaskRuntime.every(60, function(token)
-	saveAllPlayers()
-end)
-
--- Later:
-autosave:Cancel("server shutting down")
-autosave:Await()
-```
-
-Repeating callbacks never overlap. When one iteration takes too long, missed intervals are skipped rather than replayed in a burst.
-
-## Run once per physics frame
-
-Passing `0` to `every` runs once per physics frame.
-
-```luau
-local movementLoop = TaskRuntime.every(0, function(token)
-	updateCustomMovement()
+local updater = TaskRuntime.every(0, function(token)
+	updateVehiclePhysics()
 end)
 ```
 
-Keep frame callbacks small. Use a slower interval for work that does not need frame-level updates.
+Keep frame callbacks small.
 
-## Give a task a readable name and metadata
-
-```luau
-local task = TaskRuntime.spawn(function(token)
-	loadInventory()
-end)
-
-task:SetName("LoadInventory")
-task:SetMetadata("playerID", player.UserID)
-task:SetMetadata("system", "inventory")
-
-print(task.Name)
-print(task:GetMetadata("playerID"))
-print(task:GetElapsedTime())
-```
-
-Names and metadata appear in runtime snapshots.
-
-## React without blocking
+## 8. Stop a repeating task
 
 ```luau
-local task = TaskRuntime.spawn(function(token)
-	return loadProfile()
-end)
-
-local connection = task:OnComplete(function(handle)
-	if handle.State == "completed" then
-		print("Profile loaded")
-	elseif handle.State == "failed" then
-		warn(handle.Error)
-	end
-end)
+autosave:Cancel("server stopping")
+autosave:Await(2)
 ```
 
-Disconnect the observer when it is no longer needed:
-
-```luau
-connection:Disconnect()
-```
-
-## Stop waiting after a deadline
-
-`Await(timeout)` stops waiting but leaves the task running.
-
-```luau
-local task = TaskRuntime.spawn(function(token)
-	return performSlowOperation()
-end)
-
-local success, result = task:Await(2)
-if not success and result == "timeout" then
-	warn("The task is still running")
-end
-```
-
-You can await the same task again later.
-
-## Cancel a task after a deadline
+## 9. Cooperative worker loop
 
 ```luau
 local worker = TaskRuntime.spawn(function(token)
 	while not token:IsCancelled() do
-		performOneWorkStep()
+		processOneQueueItem()
 		TaskRuntime.wait(0)
+	end
+end)
+```
+
+## 10. Cancellable sleep
+
+```luau
+local worker = TaskRuntime.spawn(function(token)
+	print("Waiting")
+
+	if not token:Wait(5) then
+		print("Cancelled before five seconds")
+		return
+	end
+
+	print("Five seconds passed")
+end)
+```
+
+## 11. Cancellation callback
+
+```luau
+local worker = TaskRuntime.spawn(function(token)
+	local connection = token:OnCancel(function(reason)
+		print("Worker cancellation requested:", reason)
+	end)
+
+	while not token:IsCancelled() do
+		token:Wait(0)
+	end
+end)
+```
+
+## 12. Shared cancellation source
+
+```luau
+local source = TaskRuntime.cancellationSource()
+
+TaskRuntime.spawn(function(token)
+	while not source.Token:IsCancelled() do
+		updateMapMarkers()
+		source.Token:Wait(1)
+	end
+end)
+
+TaskRuntime.spawn(function(token)
+	while not source.Token:IsCancelled() do
+		updateQuestArrows()
+		source.Token:Wait(1)
+	end
+end)
+
+source:Cancel("HUD closed")
+```
+
+## 13. Linked cancellation source
+
+```luau
+local function runChildWork(parentToken)
+	local childSource = TaskRuntime.cancellationSource(parentToken)
+
+	TaskRuntime.spawn(function(token)
+		while not childSource.Token:IsCancelled() do
+			performChildStep()
+			childSource.Token:Wait(0)
+		end
+	end)
+
+	return childSource
+end
+```
+
+## 14. Await with a timeout
+
+```luau
+local success, value = loadTask:Await(3)
+
+if not success and value == "timeout" then
+	warn("Load is still running")
+end
+```
+
+The task is not cancelled by the wait timeout.
+
+## 15. Read a structured outcome
+
+```luau
+local outcome = loadTask:AwaitOutcome(3)
+
+if outcome.Status == "completed" then
+	local profile = outcome.Values[1]
+	useProfile(profile)
+elseif outcome.Status == "failed" then
+	warn(outcome.Error.Code, outcome.Error.Message)
+elseif outcome.Status == "cancelled" then
+	warn("Cancelled:", outcome.CancellationReason)
+elseif outcome.Status == "timeout" then
+	warn("Still running")
+end
+```
+
+## 16. Cancel after a deadline
+
+```luau
+local worker = TaskRuntime.spawn(function(token)
+	while not token:IsCancelled() do
+		doExpensiveWork()
+		token:Wait(0)
 	end
 end)
 
 worker:CancelAfter(5, "worker deadline")
 ```
 
-The task must still check its token and exit cooperatively.
-
-## Create a task with a timeout
+## 17. Task with a timeout
 
 ```luau
-local request = TaskRuntime.withTimeout(3, function(token)
-	while not token:IsCancelled() do
-		local result = pollForResult()
-		if result ~= nil then
-			return result
-		end
-		TaskRuntime.wait(0)
-	end
-end)
-
-local success, value = request:Await(5)
-if not success then
-	warn("Request ended:", value)
-end
-```
-
-## Share cancellation between several systems
-
-```luau
-local source = TaskRuntime.cancellationSource()
-
-TaskRuntime.spawn(function(token)
-	while not token:IsCancelled() and not source.Token:IsCancelled() do
-		updateWeather()
-		TaskRuntime.wait(1)
-	end
-end)
-
-TaskRuntime.spawn(function(token)
-	while not token:IsCancelled() and not source.Token:IsCancelled() do
-		updateLighting()
-		TaskRuntime.wait(1)
-	end
-end)
-
-source:Cancel("world cycle stopped")
-```
-
-## Link cancellation to a parent task
-
-```luau
-local parent = TaskRuntime.spawn(function(parentToken)
-	local childSource = TaskRuntime.cancellationSource(parentToken)
-
-	TaskRuntime.spawn(function(token)
-		while not childSource.Token:IsCancelled() do
-			performChildWork()
-			TaskRuntime.wait(0)
-		end
-	end)
-
-	while not parentToken:IsCancelled() do
-		TaskRuntime.wait(0)
-	end
+local request = TaskRuntime.withTimeout(4, function(token)
+	return performRequest(token)
 end)
 ```
 
-Cancelling the parent token also cancels the linked source.
-
-## Retry temporary failures
+## 18. Observe completion without blocking
 
 ```luau
-local profileRequest = TaskRuntime.retry(4, function(token, attempt, playerID)
-	return loadRemoteProfile(playerID)
+local connection = request:OnComplete(function(handle)
+	print(handle.Name, handle.State)
+end)
+```
+
+## 19. Name and tag tasks
+
+```luau
+local task = TaskRuntime.spawn(function(token)
+	return savePlayer(player)
+end)
+
+task:SetName("SavePlayer")
+task:SetMetadata("playerID", player.UserID)
+task:SetMetadata("reason", "autosave")
+```
+
+## 20. Transform a successful result
+
+```luau
+local inventoryTask = loadProfileTask:Then(function(token, profile)
+	return buildInventory(profile)
+end)
+```
+
+## 21. Recover from a failure
+
+```luau
+local safeTask = remoteLoadTask:Catch(function(token, taskError, cancellationReason)
+	warn(taskError and taskError.Message or cancellationReason)
+	return createDefaultProfile()
+end)
+```
+
+## 22. Always run final logic
+
+```luau
+local observedTask = requestTask:Finally(function(token, outcome)
+	setLoadingIconVisible(false)
+	print("Request ended with", outcome.Status)
+end)
+```
+
+## 23. Retry a temporary operation
+
+```luau
+local saveTask = TaskRuntime.retry(4, function(token, attempt, player)
+	return savePlayer(player)
 end, {
 	delaySeconds = 0.25,
 	backoffFactor = 2,
 	maxDelaySeconds = 2,
+	jitter = 0.1,
 	shouldRetry = function(message, attempt)
 		return string.find(message, "temporary", 1, true) ~= nil
 	end,
 	onRetry = function(message, attempt, nextDelay)
-		warn("Retrying profile load", attempt, nextDelay, message)
+		warn("Save retry", attempt, nextDelay, message)
 	end,
-}, player.UserID)
-
-local success, profile = profileRequest:Await(10)
-if not success then
-	warn("Profile load failed:", profile)
-end
+}, player)
 ```
 
-A retry happens only when the callback throws an error. A normal return counts as success.
-
-## Wait for several tasks
+## 24. Load two systems in parallel
 
 ```luau
 local profileTask = TaskRuntime.spawn(function(token)
-	return loadProfile()
+	return loadProfile(player)
 end)
 
 local inventoryTask = TaskRuntime.spawn(function(token)
-	return loadInventory()
+	return loadInventory(player)
 end)
 
-local settingsTask = TaskRuntime.spawn(function(token)
-	return loadSettings()
-end)
-
-local group = TaskRuntime.all({
-	profileTask,
-	inventoryTask,
-	settingsTask,
-})
-
+local group = TaskRuntime.all({ profileTask, inventoryTask })
 local success, results = group:Await(5)
+
 if success then
 	local profile = results[1][1]
 	local inventory = results[2][1]
-	local settings = results[3][1]
+	startPlayer(player, profile, inventory)
 end
 ```
 
-By default, a failed or cancelled child fails the group and cancels unfinished siblings.
-
-## Collect every task outcome
-
-Use non-fail-fast mode when every result matters.
+## 25. Collect every outcome
 
 ```luau
-local group = TaskRuntime.all({ firstTask, secondTask, thirdTask }, {
-	failFast = false,
-	cancelRemaining = false,
-})
+local group = TaskRuntime.settle({ firstTask, secondTask, thirdTask })
+local success, outcomes = group:Await(5)
 
-local success, outcomes = group:Await(10)
-if success then
-	for index, outcome in ipairs(outcomes) do
-		if outcome.Success then
-			print(index, outcome.Values[1])
-		else
-			warn(index, outcome.State, outcome.Error)
-		end
-	end
+for index, outcome in ipairs(outcomes) do
+	print(index, outcome.Status)
 end
 ```
 
-## Use the first completed task
+## 26. Use the fastest request
 
 ```luau
 local primary = TaskRuntime.spawn(function(token)
-	return requestPrimarySource()
+	return loadFromPrimary(token)
 end)
 
-local fallback = TaskRuntime.delay(0.25, function(token)
-	return requestFallbackSource()
+local mirror = TaskRuntime.spawn(function(token)
+	return loadFromMirror(token)
 end)
 
-local race = TaskRuntime.race({ primary, fallback })
-local success, winnerIndex, value = race:Await(3)
+local fastest = TaskRuntime.race({ primary, mirror })
+local success, winnerIndex, value = fastest:Await(3)
+```
 
-if success then
-	print("Winner:", winnerIndex, value)
+## 27. Use the first successful source
+
+```luau
+local cacheTask = TaskRuntime.spawn(function(token)
+	return loadFromCache()
+end)
+
+local networkTask = TaskRuntime.spawn(function(token)
+	return loadFromNetwork()
+end)
+
+local fallbackTask = TaskRuntime.spawn(function(token)
+	return createFallbackData()
+end)
+
+local firstSuccess = TaskRuntime.any({ cacheTask, networkTask, fallbackTask })
+local success, winnerIndex, value = firstSuccess:Await(5)
+```
+
+## 28. Process an array in parallel
+
+```luau
+local task = TaskRuntime.map(parts, function(token, part, index)
+	return calculatePartData(part)
+end)
+```
+
+## 29. Limit expensive parallel work
+
+```luau
+local task = TaskRuntime.mapLimit(npcs, 4, function(token, npc, index)
+	return calculatePath(npc)
+end)
+```
+
+Only four callbacks run inside the protected section at once.
+
+## 30. Limit profile saves with a semaphore
+
+```luau
+local saveSemaphore = TaskRuntime.semaphore(3)
+
+local function saveWithLimit(token, player)
+	local acquired, reason = saveSemaphore:Acquire(token, 2)
+	if not acquired then
+		return false, reason
+	end
+
+	local succeeded, result = pcall(savePlayer, player)
+	saveSemaphore:Release()
+
+	if not succeeded then
+		error(result)
+	end
+
+	return true
 end
 ```
 
-The unfinished loser is cancelled by default.
-
-## Own a system with a cleanup scope
+## 31. Use `WithPermit`
 
 ```luau
-local systemScope = TaskRuntime.scope("RoundSystem")
+local success, result = semaphore:WithPermit(token, function(player)
+	return savePlayer(player)
+end, 2, player)
+```
 
-systemScope:Every(1, function(token)
-	updateRoundClock()
+## 32. Create a bounded work queue
+
+```luau
+local saveQueue = TaskRuntime.queue(3, {
+	name = "ProfileSaves",
+})
+
+local task = saveQueue:Add(function(token, player)
+	return savePlayer(player)
+end, player)
+```
+
+## 33. Close a queue
+
+```luau
+saveQueue:Close("server shutdown")
+```
+
+Pending and running queue tasks receive cancellation.
+
+## 34. Debounce repeated saves
+
+```luau
+local function requestSave(player)
+	return TaskRuntime.debounce(player.UserID, 0.5, function(token)
+		return savePlayer(player)
+	end)
+end
+```
+
+Every new call inside the window cancels the previous pending save.
+
+## 35. Throttle network updates
+
+```luau
+local function sendPosition(player)
+	local task, existingTask = TaskRuntime.throttle(player.UserID, 0.1, function(token)
+		return sendPositionUpdate(player)
+	end)
+
+	if task == nil then
+		return existingTask
+	end
+
+	return task
+end
+```
+
+## 36. Basic cleanup scope
+
+```luau
+local scope = TaskRuntime.scope("Round")
+
+scope:Delay(60, function(token)
+	endRound()
 end)
 
-systemScope:Delay(120, function(token)
-	requestRoundEnd()
+scope:Every(5, function(token)
+	updateRoundUI()
 end)
 
-systemScope:Connect(game["Players"].PlayerAdded, function(player)
+scope:Add(function(reason)
+	clearRoundState()
+end)
+```
+
+## 37. Clean a signal connection
+
+```luau
+scope:Connect(game["Players"].PlayerAdded, function(player)
 	addPlayerToRound(player)
 end)
-
-function stopRound()
-	systemScope:Destroy("round ended")
-end
 ```
 
-Destroying the scope cancels its tasks and disconnects its connections.
-
-## Wait for complete scope shutdown
+## 38. Clean an instance
 
 ```luau
-local success, reason, errors = systemScope:DestroyAndAwait("system stopped", 5)
-
-if not success then
-	warn("Shutdown did not finish cleanly:", reason)
-end
+local temporaryPart = createTemporaryPart()
+scope:Add(temporaryPart, "Destroy")
 ```
 
-Use a timeout so a task that ignores cancellation cannot block forever.
-
-## Clean up a temporary instance
+## 39. Resource options
 
 ```luau
-local effectScope = TaskRuntime.scope("ExplosionEffect")
-local effectPart = Instance.New("Part")
-
-effectPart.Parent = game["Environment"]
-effectScope:Add(effectPart, "Destroy")
-
-effectScope:Delay(3, function(token)
-	effectScope:Destroy("effect expired")
-end)
+scope:Add(profileCache, {
+	method = "Close",
+	name = "ProfileCache",
+	timeout = 2,
+})
 ```
 
-## Run custom cleanup code
+## 40. Replace a named timer
 
 ```luau
-local vehicleScope = TaskRuntime.scope("Vehicle")
+roundScope:Set("RoundTimer", TaskRuntime.delay(60, function(token)
+	endRound()
+end))
 
-vehicleScope:Add(function(reason)
-	resetVehicleForces(vehicle)
-	print("Vehicle cleanup:", reason)
-end)
+roundScope:Set("RoundTimer", TaskRuntime.delay(90, function(token)
+	endRound()
+end))
 ```
 
-Custom cleanup callbacks receive the cleanup reason.
+The second call cancels the first timer.
 
-## Manage a signal connection
-
-```luau
-local playerScope = TaskRuntime.scope("PlayerSignals")
-
-playerScope:Connect(player.CharacterAdded, function(character)
-	prepareCharacter(character)
-end)
-
--- Later:
-playerScope:Destroy("player left")
-```
-
-## Replace one named resource
-
-This pattern is useful for cooldowns, timers, active effects, and current requests.
+## 41. Remove a named resource
 
 ```luau
-local abilityScope = TaskRuntime.scope("Ability")
-
-local function startCooldown(seconds)
-	abilityScope:Set("Cooldown", TaskRuntime.delay(seconds, function(token)
-		setAbilityReady(true)
-	end))
-end
-
-startCooldown(10)
-startCooldown(5) -- Cancels and replaces the first cooldown.
-```
-
-Read or remove the resource:
-
-```luau
-local cooldown = abilityScope:Get("Cooldown")
-local hasCooldown = abilityScope:Has("Cooldown")
-abilityScope:Remove("Cooldown")
+local timer = roundScope:Remove("RoundTimer")
 ```
 
 Pass `false` as the second argument to detach without cleaning:
 
 ```luau
-local detached = abilityScope:Remove("Cooldown", false)
+local timer = roundScope:Remove("RoundTimer", false)
 ```
 
-## Create child scopes
+## 42. Child scopes
 
 ```luau
 local matchScope = TaskRuntime.scope("Match")
 local roundScope = matchScope:Child("Round")
 local effectsScope = roundScope:Child("Effects")
-
-roundScope:Every(1, function(token)
-	updateRoundClock()
-end)
-
-effectsScope:Delay(10, function(token)
-	removeRoundEffect()
-end)
-
-matchScope:Destroy("match ended")
 ```
 
-Destroying the parent destroys every child scope.
+Destroying `matchScope` destroys both descendants.
 
-## Player lifecycle
+## 43. Player lifecycle scope
 
 ```luau
-local playersScope = TaskRuntime.scope("Players")
+local playerScopes = {}
 
-playersScope:Connect(game["Players"].PlayerAdded, function(player)
-	local key = "Player_" .. tostring(player.UserID)
-	local playerScope = TaskRuntime.scope(key)
-	playersScope:Set(key, playerScope, "Destroy")
+local function startPlayer(player)
+	local scope = TaskRuntime.scope("Player:" .. tostring(player.UserID), {
+		cleanupTimeout = 5,
+		resourceCleanupTimeout = 1,
+	})
+	playerScopes[player] = scope
 
-	playerScope:Every(60, function(token)
+	scope:Every(30, function(token)
 		savePlayer(player)
 	end)
 
-	playerScope:Connect(player.CharacterAdded, function(character)
-		prepareCharacter(player, character)
+	scope:Spawn(function(token)
+		while not token:IsCancelled() do
+			updatePlayerState(player)
+			token:Wait(0)
+		end
 	end)
-end)
+end
 
-playersScope:Connect(game["Players"].PlayerRemoved, function(player)
-	local key = "Player_" .. tostring(player.UserID)
-	playersScope:Remove(key, true, "player left")
-end)
+local function stopPlayer(player)
+	local scope = playerScopes[player]
+	playerScopes[player] = nil
+
+	if scope ~= nil then
+		scope:Destroy("player left")
+	end
+end
 ```
 
-## Round lifecycle
+## 44. Round lifecycle
 
 ```luau
 local currentRoundScope = nil
@@ -497,155 +566,172 @@ local function startRound()
 		currentRoundScope:Destroy("round replaced")
 	end
 
-	local roundScope = TaskRuntime.scope("Round")
-	currentRoundScope = roundScope
+	local scope = TaskRuntime.scope("Round")
+	currentRoundScope = scope
 
-	roundScope:Every(1, function(token)
-		updateRoundClock()
+	scope:Delay(120, function(token)
+		finishRound()
 	end)
 
-	roundScope:Delay(120, function(token)
-		requestRoundEnd()
+	scope:Every(1, function(token)
+		updateRoundClock()
 	end)
 end
 
-local function finishRound()
-	local roundScope = currentRoundScope
-	currentRoundScope = nil
-
-	if roundScope ~= nil then
-		local success, reason = roundScope:DestroyAndAwait("round finished", 5)
-		if not success then
-			warn("Round cleanup issue:", reason)
-		end
+local function stopRound()
+	if currentRoundScope ~= nil then
+		currentRoundScope:Destroy("round ended")
+		currentRoundScope = nil
 	end
-
-	startRound()
 end
 ```
 
-This prevents timers and loops from the old round from reaching the new round.
-
-## Boat or vehicle lifecycle
+## 45. Boat controller lifecycle
 
 ```luau
-local function startBoatController(boat)
-	local boatScope = TaskRuntime.scope("BoatController")
+local function startBoat(boat)
+	local scope = TaskRuntime.scope("Boat")
 
-	boatScope:Every(0, function(token)
-		updateBoatMovement(boat)
-	end):SetName("BoatMovement")
+	scope:Every(0, function(token)
+		updateBoatPhysics(boat)
+	end)
 
-	boatScope:Every(1, function(token)
-		checkBoatState(boat)
-	end):SetName("BoatStateCheck")
+	scope:Connect(boat.Destroying, function()
+		scope:Destroy("boat removed")
+	end)
 
-	boatScope:Add(function(reason)
+	scope:Add(function(reason)
 		resetBoatForces(boat)
 	end)
 
-	return boatScope
-end
-
-local boatScope = startBoatController(boat)
-
-local function removeBoat()
-	boatScope:Destroy("boat removed")
-	boat:Destroy()
+	return scope
 end
 ```
 
-## Temporary player effect
+## 46. Temporary effect lifecycle
 
 ```luau
-local effectScope = TaskRuntime.scope("SpeedBoost")
+local function playEffect(target)
+	local scope = TaskRuntime.scope("TemporaryEffect")
+	local effect = createEffect(target)
 
-applySpeedBoost(player)
+	scope:Add(effect, "Destroy")
+	scope:Delay(2, function(token)
+		scope:Destroy("effect finished")
+	end)
 
-effectScope:Add(function(reason)
-	removeSpeedBoost(player)
-end)
-
-effectScope:Delay(10, function(token)
-	effectScope:Destroy("boost expired")
-end)
+	return scope
+end
 ```
 
-Destroy the same scope early if the player dies, leaves, or the effect is replaced.
-
-## Supervise a group of workers
-
-A supervising scope can shut down its remaining resources when one owned task fails.
+## 47. Cleanup deadlines
 
 ```luau
-local systemScope = TaskRuntime.scope("InventorySystem", {
+local scope = TaskRuntime.scope("ServerShutdown", {
+	cleanupTimeout = 5,
+	resourceCleanupTimeout = 1,
+})
+
+scope:Add(profileCache, {
+	method = "Close",
+	name = "ProfileCache",
+	timeout = 2,
+})
+
+scope:Add(networkClient, {
+	method = "Disconnect",
+	name = "NetworkClient",
+	timeout = 0.5,
+})
+
+local success, reason, errors = scope:DestroyAndAwait("server shutdown", 6)
+```
+
+## 48. Inspect cleanup errors
+
+```luau
+for _, cleanupError in ipairs(scope:GetCleanupErrors()) do
+	warn(cleanupError.Code, cleanupError.Message, cleanupError.ScopeName)
+end
+```
+
+## 49. Stop a scope when one worker fails
+
+```luau
+local scope = TaskRuntime.scope("CriticalSystem", {
 	cancelOnTaskFailure = true,
 })
 
-systemScope:Spawn(function(token)
-	runInventoryWorker(token)
-end):SetName("InventoryWorker")
-
-systemScope:Spawn(function(token)
-	runSaveWorker(token)
-end):SetName("SaveWorker")
+scope:Spawn(function(token)
+	runCriticalWorker(token)
+end):SetName("CriticalWorker")
 ```
 
-Inspect failures later:
+## 50. Root task context
 
 ```luau
-for _, failure in ipairs(systemScope:GetTaskFailures()) do
-	warn(failure.Handle.Name, failure.Error)
-end
+local scope = TaskRuntime.scope("InventorySystem")
+
+local rootTask = scope:Run(function(context, token, player)
+	context:Every(30, function(childToken)
+		saveInventory(player)
+	end)
+
+	context:Spawn(function(childToken)
+		watchInventory(player, childToken)
+	end)
+
+	return loadInventory(player)
+end, {
+	name = "InventoryRoot",
+	cancelOnChildFailure = true,
+	childShutdownTimeout = 5,
+}, player)
 ```
 
-## Handle cleanup failures
+When the root callback returns, its context cancels and awaits the child tasks.
 
-Cleanup continues even when one resource throws.
+## 51. Nested task contexts
 
 ```luau
-TaskRuntime.setCleanupErrorHandler(function(message, scope, record)
-	warn("Cleanup failed", scope.Name, message)
+scope:Run(function(context, token)
+	local effectsContext = context:Child("Effects", {
+		cancelOnChildFailure = false,
+	})
+
+	effectsContext:Every(0, function(effectToken)
+		updateEffects()
+	end)
+
+	token:Wait(10)
+	effectsContext:Close("effects complete", 2)
 end)
+```
 
-local success, reason, errors = systemScope:DestroyAndAwait("system stopped", 5)
-if not success and reason == "cleanup failed" then
-	for _, cleanupError in ipairs(errors) do
-		warn(cleanupError.Message)
+## 52. Context cancellation from a child failure
+
+```luau
+scope:Run(function(context, token)
+	context:Spawn(function(childToken)
+		error("critical child failed")
+	end)
+
+	while not token:IsCancelled() and not context.Token:IsCancelled() do
+		context.Token:Wait(0)
 	end
-end
+end, {
+	cancelOnChildFailure = true,
+})
 ```
 
-Restore the default handler:
-
-```luau
-TaskRuntime.setCleanupErrorHandler(nil)
-```
-
-## Handle task failures globally
-
-```luau
-TaskRuntime.setErrorHandler(function(message, handle)
-	warn("Task failed", handle.Id, handle.Name, message)
-end)
-```
-
-Restore the default handler:
-
-```luau
-TaskRuntime.setErrorHandler(nil)
-```
-
-## Inspect active tasks
+## 53. Active task snapshot
 
 ```luau
 local snapshot = TaskRuntime.getSnapshot()
 
-print("Active tasks:", snapshot.ActiveCount)
-
-for kind, count in pairs(snapshot.ByKind) do
-	print(kind, count)
-end
+print("Active:", snapshot.ActiveCount)
+print("Peak:", snapshot.PeakActiveCount)
+print("Deadlines:", snapshot.PendingDeadlines)
 
 for _, taskInfo in ipairs(snapshot.Tasks) do
 	print(
@@ -653,40 +739,133 @@ for _, taskInfo in ipairs(snapshot.Tasks) do
 		taskInfo.Name,
 		taskInfo.Kind,
 		taskInfo.State,
-		taskInfo.Age
+		taskInfo.ParentTaskId,
+		taskInfo.OwnerScopeName
 	)
 end
 ```
 
-## Warn about long-running tasks
+## 54. Completed task history
 
 ```luau
-local count = TaskRuntime.warnLongRunning(10)
-print("Long-running tasks:", count)
+TaskRuntime.configureDiagnostics({
+	historySize = 200,
+	captureCreationTrace = false,
+})
+
+for _, record in ipairs(TaskRuntime.getHistory()) do
+	print(record.Name, record.State, record.Elapsed)
+end
 ```
 
-Set useful task names first so warnings identify the responsible system.
-
-## Root server lifecycle
+## 55. Task statistics
 
 ```luau
-local TaskRuntime = require(game["ScriptService"]["TaskRuntime"])
-local rootScope = TaskRuntime.scope("ServerRoot")
+local stats = TaskRuntime.getStats()
 
-rootScope:Every(60, function(token)
-	cleanupUnusedObjects()
-end):SetName("UnusedObjectCleanup")
+for name, values in pairs(stats) do
+	print(
+		name,
+		values.Count,
+		values.Completed,
+		values.Failed,
+		values.Cancelled,
+		values.AverageDuration,
+		values.MaxDuration
+	)
+end
+```
 
-rootScope:Every(300, function(token)
-	saveAllPlayers()
-end):SetName("GlobalAutosave")
+## 56. Long-running task warning
+
+```luau
+TaskRuntime.warnLongRunning(10)
+```
+
+## 57. Custom error handlers
+
+```luau
+TaskRuntime.setErrorHandler(function(message, handle, taskError)
+	warn("Task failed", handle.Name, taskError.Code, message)
+end)
+
+TaskRuntime.setCleanupErrorHandler(function(message, scope, record)
+	warn("Cleanup failed", scope.Name, record.Code, message)
+end)
+```
+
+## 58. Isolated runtime instance
+
+```luau
+local runtime = TaskRuntime.create({
+	historySize = 50,
+})
+
+local task = runtime:spawn(function(token)
+	return 5
+end)
+```
+
+Task handles from different runtime instances cannot be combined.
+
+## 59. Virtual-time timer test
+
+```luau
+local scheduler = TaskRuntime.TestScheduler.new(0)
+local runtime = TaskRuntime.create({
+	scheduler = scheduler,
+})
+
+local task = runtime:delay(3600, function(token)
+	return "one hour"
+end)
+
+scheduler:Advance(3600)
+
+local success, value = task:Await()
+assert(success and value == "one hour")
+```
+
+## 60. Virtual-time retry test
+
+```luau
+local scheduler = TaskRuntime.TestScheduler.new(0)
+local runtime = TaskRuntime.create({
+	scheduler = scheduler,
+})
+
+local attempts = 0
+local task = runtime:retry(3, function(token, attempt)
+	attempts = attempts + 1
+	if attempt < 3 then
+		error("temporary")
+	end
+	return "done"
+end, {
+	delaySeconds = 60,
+})
+
+scheduler:Advance(120)
+
+local success, value = task:Await()
+assert(success and value == "done")
+assert(attempts == 3)
+```
+
+## 61. Server root scope
+
+```luau
+local rootScope = TaskRuntime.scope("ServerRoot", {
+	cleanupTimeout = 5,
+	resourceCleanupTimeout = 1,
+})
 
 function Shutdown()
-	rootScope:Destroy("server root shutdown")
+	rootScope:Destroy("server shutdown")
 end
 
 function ShutdownAndAwait()
-	return rootScope:DestroyAndAwait("server root shutdown", 5)
+	return rootScope:DestroyAndAwait("server shutdown", 6)
 end
 
 function _Dispose()
@@ -694,52 +873,78 @@ function _Dispose()
 end
 ```
 
-The current game runtime does not automatically call `_Dispose()`. Call `Shutdown()` or `ShutdownAndAwait()` explicitly through `BaseScript:Call()`.
-
-## Final runtime shutdown
-
-Use global shutdown only when the entire task runtime is ending.
+## 62. Full runtime shutdown
 
 ```luau
-TaskRuntime.shutdown("server process ending")
+TaskRuntime.shutdown("server session ended")
 ```
 
-After global shutdown, new tasks cannot be scheduled during that session. Do not use it to end a normal round, player session, vehicle controller, or menu. Destroy that system's scope instead.
+Use this only when the entire runtime is ending. New tasks are rejected after shutdown.
 
 ## Common mistakes
 
-### Using raw waits in cancellable work
+### Ignoring the token
+
+Incorrect:
 
 ```luau
--- Avoid when cancellation should interrupt the delay.
-wait(10)
-
--- Prefer:
-if not token:Wait(10) then
-	return
-end
+TaskRuntime.spawn(function(token)
+	while true do
+		doWork()
+		TaskRuntime.wait(0)
+	end
+end)
 ```
 
-### Ignoring the cancellation token
+Correct:
 
 ```luau
--- This cannot stop cooperatively.
-while true do
-	performWork()
-	TaskRuntime.wait(0)
-end
-
--- Prefer:
-while not token:IsCancelled() do
-	performWork()
-	TaskRuntime.wait(0)
-end
+TaskRuntime.spawn(function(token)
+	while not token:IsCancelled() do
+		doWork()
+		TaskRuntime.wait(0)
+	end
+end)
 ```
 
-### Forgetting to register a resource
+### Creating raw work inside a scope-owned system
 
-A scope only cleans resources added through `Add`, `Set`, `Connect`, `Spawn`, `Delay`, `Every`, `WithTimeout`, `Retry`, or `Child`.
+Incorrect:
 
-### Awaiting a scope from one of its own tasks
+```luau
+local scope = TaskRuntime.scope("Round")
 
-Do not call `DestroyAndAwait()` from a task owned by that same scope. The task would wait for itself to finish. Call `Destroy()` from inside the task, or let an external controller perform the awaited shutdown.
+spawn(function()
+	runRoundLoop()
+end)
+```
+
+Correct:
+
+```luau
+scope:Spawn(function(token)
+	runRoundLoop(token)
+end)
+```
+
+### Waiting for a scope from one of its own tasks
+
+Do not call `DestroyAndAwait()` from a task owned directly by the same scope. The task would wait for itself.
+
+Use `Destroy()` from inside the owned task, or call `DestroyAndAwait()` from an outside owner.
+
+### Forgetting to release a semaphore
+
+Use `pcall` or `WithPermit` so a thrown error does not permanently consume the permit.
+
+### Treating an await timeout as task cancellation
+
+```luau
+local success, reason = task:Await(1)
+```
+
+When `reason == "timeout"`, the task is still active. Use `CancelAfter()` or `withTimeout()` when the task itself should receive cancellation.
+
+### Combining runtimes
+
+Do not pass handles from two different `TaskRuntime.create()` instances into one composition call.
