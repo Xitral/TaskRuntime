@@ -52,6 +52,7 @@ def main() -> None:
     package_files = (
         ("README.md", "README.md"),
         ("LICENSE", "LICENSE"),
+        ("AI_DISCLOSURE.md", "AI_DISCLOSURE.md"),
         ("CHANGELOG.md", "CHANGELOG.md"),
         ("scripts/modules/TaskRuntime.luau", "TaskRuntime.luau"),
         ("scripts/modules/TaskRuntimeTypes.luau", "TaskRuntimeTypes.luau"),
