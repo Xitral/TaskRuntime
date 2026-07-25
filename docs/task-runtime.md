@@ -5,8 +5,12 @@
 Current version:
 
 ```text
-3.0.0
+3.0.3
 ```
+
+## Release status
+
+Version 3.0.3 is the first supported public release. TaskRuntime follows semantic versioning and keeps compatible APIs stable within the same major version.
 
 ## Why this is needed
 
@@ -57,6 +61,7 @@ Destroying the scope cancels the timer and disconnects the signal.
 - `scripts/modules/TaskRuntimeTypes.luau`: optional exported Luau types
 - `scripts/server/script.server.luau`: server root example
 - `scripts/tests/task-runtime-test.server.luau`: Creator self-test
+- `scripts/tests/task-runtime-stress-test.server.luau`: optional Creator stress test
 - `docs/task-runtime.md`: main documentation
 - `docs/task-runtime-examples.md`: copy-paste examples
 
@@ -917,6 +922,20 @@ The test covers:
 - active task release
 
 Remove or disable the test script after verification.
+
+Run the stress test separately with the integration test disabled:
+
+```text
+scripts/tests/task-runtime-stress-test.server.luau
+```
+
+A successful run prints:
+
+```text
+TaskRuntime stress test passed
+```
+
+The stress test exercises bounded concurrency, result ordering, mass cancellation, deadline cleanup, and active-task release.
 
 ## API reference
 
