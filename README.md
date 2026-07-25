@@ -58,6 +58,7 @@ Destroying the scope cancels its tasks and cleans every registered resource.
 
 - [Complete guide](docs/task-runtime.md)
 - [Copy-paste examples](docs/task-runtime-examples.md)
+- [AI assistance disclosure](AI_DISCLOSURE.md)
 - [Contributing](CONTRIBUTING.md)
 - [Release process](RELEASING.md)
 - [Security policy](SECURITY.md)
@@ -95,6 +96,10 @@ TaskRuntime uses Polytoria's supported `wait` path for the default scheduler. Ra
 ## Versioning
 
 TaskRuntime follows semantic versioning. Public API removals or incompatible behavior changes require a major version update.
+
+## AI assistance disclosure
+
+Portions of TaskRuntime's source code, tests, documentation, and release tooling were drafted or revised with AI assistance. The project maintainer reviewed, tested, and accepted the released work and remains responsible for its behavior, maintenance, licensing, and support. See [AI_DISCLOSURE.md](AI_DISCLOSURE.md) for the full statement.
 
 ## License
 
