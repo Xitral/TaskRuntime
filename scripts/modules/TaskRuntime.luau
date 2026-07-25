@@ -1,9 +1,12 @@
 -- TaskRuntime
--- Cancellable scheduling and deterministic resource cleanup for Polytoria Luau.
+-- Structured asynchronous tasks, cooperative cancellation, and deterministic cleanup for Polytoria Luau.
 --
--- Every scheduled callback receives a CancellationToken as its first argument.
--- Pending tasks cancel immediately. Running tasks enter the "cancelling" state
--- and remain active until their callback exits cooperatively.
+-- Design goals:
+--   * predictable task state transitions
+--   * cancellation that remains honest about running callbacks
+--   * deterministic, reverse-order resource cleanup
+--   * bounded waits, retries, and task composition
+--   * observability suitable for production debugging
 
 local TaskRuntime = {}
 
@@ -13,8 +16,11 @@ TaskHandle.__index = TaskHandle
 local CancellationToken = {}
 CancellationToken.__index = CancellationToken
 
-local CancellationConnection = {}
-CancellationConnection.__index = CancellationConnection
+local CancellationSource = {}
+CancellationSource.__index = CancellationSource
+
+local CallbackConnection = {}
+CallbackConnection.__index = CallbackConnection
 
 local CleanupScope = {}
 CleanupScope.__index = CleanupScope
@@ -37,6 +43,10 @@ local function pack(...)
 	}
 end
 
+local function unpackPacked(values)
+	return table.unpack(values, 1, values.n)
+end
+
 local function assertCallback(callback, apiName)
 	if type(callback) ~= "function" then
 		error(apiName .. " expects a function callback", 3)
@@ -51,21 +61,88 @@ local function assertSeconds(seconds, apiName, allowNil)
 		error(apiName .. " expects seconds to be a number", 3)
 	end
 	if seconds < 0 then
-		error(apiName .. " expects a non-negative delay", 3)
+		error(apiName .. " expects a non-negative duration", 3)
 	end
 end
 
-local function reportError(message, handle)
-	warn("[TaskRuntime] task " .. tostring(handle.Id) .. " failed: " .. tostring(message))
+local function assertTaskHandle(handle, apiName)
+	if getmetatable(handle) ~= TaskHandle then
+		error(apiName .. " expects a TaskHandle", 3)
+	end
 end
 
-local errorHandler = reportError
+local function assertTaskList(handles, apiName, allowEmpty)
+	if type(handles) ~= "table" then
+		error(apiName .. " expects an array of TaskHandles", 3)
+	end
+	if not allowEmpty and #handles == 0 then
+		error(apiName .. " expects at least one TaskHandle", 3)
+	end
+	for index, handle in ipairs(handles) do
+		if getmetatable(handle) ~= TaskHandle then
+			error(apiName .. " received a non-TaskHandle at index " .. tostring(index), 3)
+		end
+	end
+end
 
-local function invokeCancellationCallback(callback, reason)
-	local succeeded, callbackError = pcall(callback, reason)
+local function defaultTaskErrorHandler(message, handle)
+	warn(
+		"[TaskRuntime] task "
+			.. tostring(handle.Id)
+			.. " ("
+			.. tostring(handle.Name)
+			.. ") failed: "
+			.. tostring(message)
+	)
+end
+
+local function defaultCleanupErrorHandler(message, scope)
+	warn("[TaskRuntime] cleanup failed in " .. tostring(scope.Name) .. ": " .. tostring(message))
+end
+
+local taskErrorHandler = defaultTaskErrorHandler
+local cleanupErrorHandler = defaultCleanupErrorHandler
+
+local function invokeSafely(callback, contextMessage, ...)
+	local succeeded, callbackError = pcall(callback, ...)
 	if not succeeded then
-		warn("[TaskRuntime] cancellation callback failed: " .. tostring(callbackError))
+		warn("[TaskRuntime] " .. contextMessage .. ": " .. tostring(callbackError))
 	end
+	return succeeded, callbackError
+end
+
+function CallbackConnection:Disconnect()
+	if not self.Connected then
+		return false
+	end
+
+	self.Connected = false
+	local entry = self._entry
+	if entry ~= nil then
+		entry.Active = false
+		entry.Callback = nil
+	end
+	self._entry = nil
+	return true
+end
+
+local function disconnectedConnection()
+	return setmetatable({
+		Connected = false,
+		_entry = nil,
+	}, CallbackConnection)
+end
+
+local function registerCallback(entries, callback)
+	local entry = {
+		Active = true,
+		Callback = callback,
+	}
+	table.insert(entries, entry)
+	return setmetatable({
+		Connected = true,
+		_entry = entry,
+	}, CallbackConnection)
 end
 
 local function makeToken()
@@ -73,24 +150,7 @@ local function makeToken()
 		_cancelled = false,
 		_reason = nil,
 		_cancelCallbacks = {},
-		_nextCancelCallbackId = 0,
 	}, CancellationToken)
-end
-
-function CancellationConnection:Disconnect()
-	if not self.Connected then
-		return false
-	end
-
-	self.Connected = false
-	local token = self._token
-	if token ~= nil and token._cancelCallbacks[self._id] == self then
-		token._cancelCallbacks[self._id] = nil
-	end
-
-	self._token = nil
-	self._callback = nil
-	return true
 end
 
 function CancellationToken:IsCancelled()
@@ -101,35 +161,25 @@ function CancellationToken:GetReason()
 	return self._reason
 end
 
--- Registers a callback that runs synchronously when cancellation is requested.
--- The returned connection can be placed in a cleanup scope or disconnected directly.
+function CancellationToken:ThrowIfCancelled()
+	if self._cancelled then
+		error(self._reason or "cancelled", 2)
+	end
+end
+
 function CancellationToken:OnCancel(callback)
 	assertCallback(callback, "CancellationToken:OnCancel")
 
 	if self._cancelled then
-		invokeCancellationCallback(callback, self._reason)
-		return setmetatable({
-			Connected = false,
-			_token = nil,
-			_id = nil,
-			_callback = nil,
-		}, CancellationConnection)
+		invokeSafely(callback, "cancellation callback failed", self._reason)
+		return disconnectedConnection()
 	end
 
-	self._nextCancelCallbackId = self._nextCancelCallbackId + 1
-	local connection = setmetatable({
-		Connected = true,
-		_token = self,
-		_id = self._nextCancelCallbackId,
-		_callback = callback,
-	}, CancellationConnection)
-
-	self._cancelCallbacks[connection._id] = connection
-	return connection
+	return registerCallback(self._cancelCallbacks, callback)
 end
 
--- Waits in short slices so cancellation can be observed without waiting for the
--- entire duration. Returns false when cancelled and true when the delay elapses.
+-- Waits in short slices so cancellation can be observed before the full duration elapses.
+-- Returns false when cancelled and true when the duration completes.
 function CancellationToken:Wait(seconds, pollInterval)
 	assertSeconds(seconds, "CancellationToken:Wait", false)
 	if pollInterval ~= nil then
@@ -172,27 +222,62 @@ function CancellationToken:_Cancel(reason)
 
 	local callbacks = self._cancelCallbacks
 	self._cancelCallbacks = {}
-
-	for _, connection in pairs(callbacks) do
-		local callback = connection._callback
-		connection.Connected = false
-		connection._token = nil
-		connection._callback = nil
-
-		if callback ~= nil then
-			invokeCancellationCallback(callback, self._reason)
+	for _, entry in ipairs(callbacks) do
+		if entry.Active and entry.Callback ~= nil then
+			local callback = entry.Callback
+			entry.Active = false
+			entry.Callback = nil
+			invokeSafely(callback, "cancellation callback failed", self._reason)
 		end
 	end
 
 	return true
 end
 
+function CancellationSource.new(parentToken)
+	if parentToken ~= nil and getmetatable(parentToken) ~= CancellationToken then
+		error("CancellationSource.new expects a CancellationToken or nil", 2)
+	end
+
+	local source = setmetatable({
+		Token = makeToken(),
+		_parentConnection = nil,
+	}, CancellationSource)
+
+	if parentToken ~= nil then
+		source._parentConnection = parentToken:OnCancel(function(reason)
+			source:Cancel(reason)
+		end)
+	end
+
+	return source
+end
+
+function CancellationSource:Cancel(reason)
+	local changed = self.Token:_Cancel(reason)
+	if self._parentConnection ~= nil then
+		self._parentConnection:Disconnect()
+		self._parentConnection = nil
+	end
+	return changed
+end
+
+function CancellationSource:IsCancelled()
+	return self.Token:IsCancelled()
+end
+
+function CancellationSource:Destroy(reason)
+	return self:Cancel(reason or "cancellation source destroyed")
+end
+
 local function makeHandle(kind)
 	nextTaskId = nextTaskId + 1
+	local id = nextTaskId
 
 	local handle = setmetatable({
-		Id = nextTaskId,
+		Id = id,
 		Kind = kind,
+		Name = kind .. "#" .. tostring(id),
 		State = "scheduled",
 		Cancelled = false,
 		CancelReason = nil,
@@ -203,6 +288,7 @@ local function makeHandle(kind)
 		Results = nil,
 		Iterations = 0,
 		SkippedIntervals = 0,
+		Metadata = {},
 		Token = makeToken(),
 		_completionCallbacks = {},
 	}, TaskHandle)
@@ -222,10 +308,12 @@ local function finishHandle(handle, state)
 
 	local callbacks = handle._completionCallbacks
 	handle._completionCallbacks = {}
-	for _, callback in ipairs(callbacks) do
-		local succeeded, callbackError = pcall(callback, handle)
-		if not succeeded then
-			warn("[TaskRuntime] completion callback failed: " .. tostring(callbackError))
+	for _, entry in ipairs(callbacks) do
+		if entry.Active and entry.Callback ~= nil then
+			local callback = entry.Callback
+			entry.Active = false
+			entry.Callback = nil
+			invokeSafely(callback, "completion callback failed", handle)
 		end
 	end
 
@@ -233,6 +321,10 @@ local function finishHandle(handle, state)
 end
 
 local function runCallback(handle, callback, args)
+	if handle:IsDone() then
+		return
+	end
+
 	if handle.Cancelled or runtimeShuttingDown then
 		if not handle.Cancelled then
 			handle:Cancel(runtimeShutdownReason or "runtime shutdown")
@@ -243,7 +335,7 @@ local function runCallback(handle, callback, args)
 	handle.State = "running"
 	handle.StartedAt = time()
 
-	local callResults = pack(pcall(callback, handle.Token, table.unpack(args, 1, args.n)))
+	local callResults = pack(pcall(callback, handle.Token, unpackPacked(args)))
 	local succeeded = callResults[1]
 
 	if handle.Cancelled then
@@ -262,11 +354,37 @@ local function runCallback(handle, callback, args)
 		handle.Error = tostring(callResults[2])
 		finishHandle(handle, "failed")
 
-		local handlerSucceeded, handlerError = pcall(errorHandler, handle.Error, handle)
+		local handlerSucceeded, handlerError = pcall(taskErrorHandler, handle.Error, handle)
 		if not handlerSucceeded then
-			warn("[TaskRuntime] error handler failed: " .. tostring(handlerError))
+			warn("[TaskRuntime] task error handler failed: " .. tostring(handlerError))
 		end
 	end
+end
+
+function TaskHandle:SetName(name)
+	if type(name) ~= "string" or name == "" then
+		error("TaskHandle:SetName expects a non-empty string", 2)
+	end
+	self.Name = name
+	return self
+end
+
+function TaskHandle:SetMetadata(key, value)
+	if key == nil then
+		error("TaskHandle:SetMetadata expects a non-nil key", 2)
+	end
+	self.Metadata[key] = value
+	return self
+end
+
+function TaskHandle:GetMetadata(key)
+	return self.Metadata[key]
+end
+
+function TaskHandle:GetElapsedTime()
+	local startTime = self.StartedAt or self.CreatedAt
+	local endTime = self.FinishedAt or time()
+	return endTime - startTime
 end
 
 function TaskHandle:Cancel(reason)
@@ -287,6 +405,24 @@ function TaskHandle:Cancel(reason)
 	return true
 end
 
+function TaskHandle:CancelAfter(seconds, reason)
+	assertSeconds(seconds, "TaskHandle:CancelAfter", false)
+	if self:IsDone() then
+		return nil
+	end
+
+	local timer = TaskRuntime.delay(seconds, function()
+		self:Cancel(reason or "timeout")
+	end)
+	timer:SetName(self.Name .. ":cancel-after")
+
+	self:OnComplete(function()
+		timer:Cancel("source task completed")
+	end)
+
+	return timer
+end
+
 function TaskHandle:IsCancelled()
 	return self.Cancelled
 end
@@ -299,8 +435,35 @@ function TaskHandle:IsDone()
 	return TERMINAL_STATES[self.State] == true
 end
 
-function TaskHandle:Await()
+function TaskHandle:OnComplete(callback)
+	assertCallback(callback, "TaskHandle:OnComplete")
+	if self:IsDone() then
+		invokeSafely(callback, "completion callback failed", self)
+		return disconnectedConnection()
+	end
+	return registerCallback(self._completionCallbacks, callback)
+end
+
+function TaskHandle:_OnFinished(callback)
+	return self:OnComplete(callback)
+end
+
+-- Returns false, "timeout" if the optional timeout elapses. A timed-out Await does
+-- not cancel the task; call CancelAfter or withTimeout when cancellation is desired.
+function TaskHandle:Await(timeoutSeconds)
+	if timeoutSeconds ~= nil then
+		assertSeconds(timeoutSeconds, "TaskHandle:Await", false)
+	end
+
+	local deadline = nil
+	if timeoutSeconds ~= nil then
+		deadline = time() + timeoutSeconds
+	end
+
 	while not self:IsDone() do
+		if deadline ~= nil and time() >= deadline then
+			return false, "timeout"
+		end
 		wait(0)
 	end
 
@@ -316,79 +479,63 @@ function TaskHandle:Await()
 		return true
 	end
 
-	return true, table.unpack(self.Results, 1, self.Results.n)
-end
-
-function TaskHandle:_OnFinished(callback)
-	assertCallback(callback, "TaskHandle:_OnFinished")
-	if self:IsDone() then
-		callback(self)
-	else
-		table.insert(self._completionCallbacks, callback)
-	end
+	return true, unpackPacked(self.Results)
 end
 
 function TaskRuntime.spawn(callback, ...)
 	assertCallback(callback, "TaskRuntime.spawn")
-
 	if runtimeShuttingDown then
 		error("TaskRuntime is shut down", 2)
 	end
 
 	local handle = makeHandle("spawn")
 	local args = pack(...)
-
 	spawn(function()
 		runCallback(handle, callback, args)
 	end)
-
 	return handle
 end
 
 function TaskRuntime.defer(callback, ...)
 	assertCallback(callback, "TaskRuntime.defer")
-
 	if runtimeShuttingDown then
 		error("TaskRuntime is shut down", 2)
 	end
 
 	local handle = makeHandle("defer")
 	local args = pack(...)
-
 	spawn(function()
-		wait(0)
+		if not handle.Token:Wait(0) then
+			return
+		end
 		runCallback(handle, callback, args)
 	end)
-
 	return handle
 end
 
 function TaskRuntime.delay(seconds, callback, ...)
 	assertSeconds(seconds, "TaskRuntime.delay", false)
 	assertCallback(callback, "TaskRuntime.delay")
-
 	if runtimeShuttingDown then
 		error("TaskRuntime is shut down", 2)
 	end
 
 	local handle = makeHandle("delay")
 	local args = pack(...)
-
 	spawn(function()
-		wait(seconds)
+		if not handle.Token:Wait(seconds) then
+			return
+		end
 		runCallback(handle, callback, args)
 	end)
-
 	return handle
 end
 
--- Runs a callback repeatedly without overlap. The first run occurs after one
--- interval. Scheduling is anchored to the intended cadence; missed intervals are
--- skipped instead of being replayed in a burst.
+-- Repeats without overlap. The first run occurs after one interval. Missed
+-- intervals are counted and skipped instead of replayed in a burst.
 function TaskRuntime.every(seconds, callback, ...)
 	assertSeconds(seconds, "TaskRuntime.every", false)
 	assertCallback(callback, "TaskRuntime.every")
-
 	if runtimeShuttingDown then
 		error("TaskRuntime is shut down", 2)
 	end
@@ -398,7 +545,6 @@ function TaskRuntime.every(seconds, callback, ...)
 
 	local function repeatCallback(token)
 		local nextRunAt = time() + seconds
-
 		while not token:IsCancelled() do
 			if seconds == 0 then
 				if not token:Wait(0) then
@@ -414,7 +560,7 @@ function TaskRuntime.every(seconds, callback, ...)
 				end
 			end
 
-			callback(token, table.unpack(args, 1, args.n))
+			callback(token, unpackPacked(args))
 			handle.Iterations = handle.Iterations + 1
 
 			if seconds > 0 then
@@ -434,8 +580,232 @@ function TaskRuntime.every(seconds, callback, ...)
 	spawn(function()
 		runCallback(handle, repeatCallback, pack())
 	end)
-
 	return handle
+end
+
+function TaskRuntime.withTimeout(seconds, callback, ...)
+	assertSeconds(seconds, "TaskRuntime.withTimeout", false)
+	assertCallback(callback, "TaskRuntime.withTimeout")
+	local handle = TaskRuntime.spawn(callback, ...)
+	handle:CancelAfter(seconds, "timeout")
+	return handle
+end
+
+-- Retries only when the callback throws. A successful callback may return any values.
+-- The callback receives (token, attemptNumber, ...originalArguments).
+function TaskRuntime.retry(attemptCount, callback, options, ...)
+	if type(attemptCount) ~= "number" or attemptCount < 1 or attemptCount % 1 ~= 0 then
+		error("TaskRuntime.retry expects attemptCount to be a positive integer", 2)
+	end
+	assertCallback(callback, "TaskRuntime.retry")
+
+	if options == nil then
+		options = {}
+	elseif type(options) ~= "table" then
+		error("TaskRuntime.retry expects options to be a table or nil", 2)
+	end
+
+	local delaySeconds = options.delaySeconds or 0
+	local backoffFactor = options.backoffFactor or 1
+	local maxDelaySeconds = options.maxDelaySeconds
+	assertSeconds(delaySeconds, "TaskRuntime.retry delaySeconds", false)
+	if type(backoffFactor) ~= "number" or backoffFactor < 0 then
+		error("TaskRuntime.retry backoffFactor must be a non-negative number", 2)
+	end
+	if maxDelaySeconds ~= nil then
+		assertSeconds(maxDelaySeconds, "TaskRuntime.retry maxDelaySeconds", false)
+	end
+	if options.shouldRetry ~= nil then
+		assertCallback(options.shouldRetry, "TaskRuntime.retry shouldRetry")
+	end
+	if options.onRetry ~= nil then
+		assertCallback(options.onRetry, "TaskRuntime.retry onRetry")
+	end
+
+	local args = pack(...)
+	local handle = TaskRuntime.spawn(function(token)
+		local currentDelay = delaySeconds
+		local lastError = nil
+
+		for attempt = 1, attemptCount do
+			if token:IsCancelled() then
+				return nil
+			end
+
+			local attemptResults = pack(pcall(callback, token, attempt, unpackPacked(args)))
+			if attemptResults[1] then
+				local results = { n = attemptResults.n - 1 }
+				for index = 2, attemptResults.n do
+					results[index - 1] = attemptResults[index]
+				end
+				return unpackPacked(results)
+			end
+
+			lastError = tostring(attemptResults[2])
+			if attempt >= attemptCount then
+				break
+			end
+
+			if options.shouldRetry ~= nil and not options.shouldRetry(lastError, attempt) then
+				break
+			end
+
+			local nextDelay = currentDelay
+			if options.onRetry ~= nil then
+				options.onRetry(lastError, attempt, nextDelay)
+			end
+
+			if nextDelay > 0 and not token:Wait(nextDelay) then
+				return nil
+			end
+
+			currentDelay = currentDelay * backoffFactor
+			if maxDelaySeconds ~= nil then
+				currentDelay = math.min(currentDelay, maxDelaySeconds)
+			end
+		end
+
+		error(lastError or "retry failed", 0)
+	end)
+	handle.Kind = "retry"
+	handle.Name = "retry#" .. tostring(handle.Id)
+	return handle
+end
+
+local function cancelRemaining(handles, winnerIndex, reason)
+	for index, handle in ipairs(handles) do
+		if index ~= winnerIndex and not handle:IsDone() then
+			handle:Cancel(reason)
+		end
+	end
+end
+
+-- Promise.all-like task composition. By default, the aggregate fails fast and
+-- cancels unfinished children. On success it returns an array of packed result arrays.
+function TaskRuntime.all(handles, options)
+	assertTaskList(handles, "TaskRuntime.all", true)
+	options = options or {}
+	if type(options) ~= "table" then
+		error("TaskRuntime.all expects options to be a table or nil", 2)
+	end
+
+	local failFast = options.failFast ~= false
+	local cancelRemainingOnFailure = options.cancelRemaining ~= false
+	local cancelChildrenOnAggregateCancel = options.cancelOnCancel ~= false
+
+	local aggregate = TaskRuntime.spawn(function(token)
+		local cancellationConnection = nil
+		if cancelChildrenOnAggregateCancel then
+			cancellationConnection = token:OnCancel(function(reason)
+				cancelRemaining(handles, nil, reason or "aggregate cancelled")
+			end)
+		end
+
+		while true do
+			local allDone = true
+			for index, handle in ipairs(handles) do
+				if not handle:IsDone() then
+					allDone = false
+				elseif failFast and handle.State ~= "completed" then
+					if cancelRemainingOnFailure then
+						cancelRemaining(handles, index, "TaskRuntime.all child failed")
+					end
+					if cancellationConnection ~= nil then
+						cancellationConnection:Disconnect()
+					end
+					local reason = handle.Error or handle.CancelReason or handle.State
+					error("child " .. tostring(index) .. " " .. handle.State .. ": " .. tostring(reason), 0)
+				end
+			end
+
+			if allDone then
+				break
+			end
+			if not token:Wait(0) then
+				if cancellationConnection ~= nil then
+					cancellationConnection:Disconnect()
+				end
+				return nil
+			end
+		end
+
+		if cancellationConnection ~= nil then
+			cancellationConnection:Disconnect()
+		end
+
+		local results = {}
+		for index, handle in ipairs(handles) do
+			if failFast then
+				results[index] = handle.Results or { n = 0 }
+			else
+				results[index] = {
+					Success = handle.State == "completed",
+					State = handle.State,
+					Values = handle.Results,
+					Error = handle.Error or handle.CancelReason,
+				}
+			end
+		end
+		return results
+	end)
+	aggregate.Kind = "all"
+	aggregate.Name = "all#" .. tostring(aggregate.Id)
+	return aggregate
+end
+
+-- Promise.race-like composition. The aggregate adopts the first terminal task.
+-- On a successful winner it returns winnerIndex followed by the winner's results.
+function TaskRuntime.race(handles, options)
+	assertTaskList(handles, "TaskRuntime.race", false)
+	options = options or {}
+	if type(options) ~= "table" then
+		error("TaskRuntime.race expects options to be a table or nil", 2)
+	end
+
+	local cancelLosers = options.cancelRemaining ~= false
+	local cancelChildrenOnAggregateCancel = options.cancelOnCancel ~= false
+
+	local aggregate = TaskRuntime.spawn(function(token)
+		local cancellationConnection = nil
+		if cancelChildrenOnAggregateCancel then
+			cancellationConnection = token:OnCancel(function(reason)
+				cancelRemaining(handles, nil, reason or "race cancelled")
+			end)
+		end
+
+		while true do
+			for index, handle in ipairs(handles) do
+				if handle:IsDone() then
+					if cancelLosers then
+						cancelRemaining(handles, index, "TaskRuntime.race lost")
+					end
+					if cancellationConnection ~= nil then
+						cancellationConnection:Disconnect()
+					end
+
+					if handle.State == "completed" then
+						if handle.Results == nil then
+							return index
+						end
+						return index, unpackPacked(handle.Results)
+					end
+
+					local reason = handle.Error or handle.CancelReason or handle.State
+					error("winner " .. tostring(index) .. " " .. handle.State .. ": " .. tostring(reason), 0)
+				end
+			end
+
+			if not token:Wait(0) then
+				if cancellationConnection ~= nil then
+					cancellationConnection:Disconnect()
+				end
+				return nil
+			end
+		end
+	end)
+	aggregate.Kind = "race"
+	aggregate.Name = "race#" .. tostring(aggregate.Id)
+	return aggregate
 end
 
 function TaskRuntime.wait(seconds)
@@ -446,9 +816,7 @@ function TaskRuntime.wait(seconds)
 end
 
 function TaskRuntime.cancel(handle, reason)
-	if getmetatable(handle) ~= TaskHandle then
-		error("TaskRuntime.cancel expects a task handle", 2)
-	end
+	assertTaskHandle(handle, "TaskRuntime.cancel")
 	return handle:Cancel(reason)
 end
 
@@ -460,10 +828,12 @@ function TaskRuntime.isDone(handle)
 	return getmetatable(handle) == TaskHandle and handle:IsDone()
 end
 
-function TaskRuntime.getActiveCount()
+function TaskRuntime.getActiveCount(kind)
 	local count = 0
-	for _ in pairs(activeTasks) do
-		count = count + 1
+	for _, handle in pairs(activeTasks) do
+		if kind == nil or handle.Kind == kind then
+			count = count + 1
+		end
 	end
 	return count
 end
@@ -479,14 +849,71 @@ function TaskRuntime.getActiveTasks()
 	return tasks
 end
 
-function TaskRuntime.setErrorHandler(handler)
-	if handler == nil then
-		errorHandler = reportError
-		return
+function TaskRuntime.getSnapshot()
+	local snapshot = {
+		Timestamp = time(),
+		ActiveCount = 0,
+		ByKind = {},
+		ByState = {},
+		Tasks = {},
+	}
+
+	for _, handle in ipairs(TaskRuntime.getActiveTasks()) do
+		snapshot.ActiveCount = snapshot.ActiveCount + 1
+		snapshot.ByKind[handle.Kind] = (snapshot.ByKind[handle.Kind] or 0) + 1
+		snapshot.ByState[handle.State] = (snapshot.ByState[handle.State] or 0) + 1
+		table.insert(snapshot.Tasks, {
+			Id = handle.Id,
+			Name = handle.Name,
+			Kind = handle.Kind,
+			State = handle.State,
+			Age = time() - handle.CreatedAt,
+			Elapsed = handle:GetElapsedTime(),
+			Iterations = handle.Iterations,
+			SkippedIntervals = handle.SkippedIntervals,
+			Metadata = handle.Metadata,
+		})
 	end
 
+	return snapshot
+end
+
+function TaskRuntime.warnLongRunning(thresholdSeconds)
+	assertSeconds(thresholdSeconds, "TaskRuntime.warnLongRunning", false)
+	local count = 0
+	for _, handle in ipairs(TaskRuntime.getActiveTasks()) do
+		local age = time() - handle.CreatedAt
+		if age >= thresholdSeconds then
+			count = count + 1
+			warn(
+				"[TaskRuntime] long-running task "
+					.. tostring(handle.Id)
+					.. " ("
+					.. tostring(handle.Name)
+					.. ") age="
+					.. tostring(age)
+			)
+		end
+	end
+	return count
+end
+
+function TaskRuntime.setErrorHandler(handler)
+	if handler == nil then
+		taskErrorHandler = defaultTaskErrorHandler
+		return
+	end
 	assertCallback(handler, "TaskRuntime.setErrorHandler")
-	errorHandler = handler
+	taskErrorHandler = handler
+end
+
+function TaskRuntime.setCleanupErrorHandler(handler)
+	if handler == nil then
+		cleanupErrorHandler = defaultCleanupErrorHandler
+		return
+	end
+	assertCallback(handler, "TaskRuntime.setCleanupErrorHandler")
+	cleanupErrorHandler = handler
 end
 
 function TaskRuntime.shutdown(reason)
@@ -496,13 +923,15 @@ function TaskRuntime.shutdown(reason)
 
 	runtimeShuttingDown = true
 	runtimeShutdownReason = reason or "runtime shutdown"
-
 	local handles = TaskRuntime.getActiveTasks()
 	for _, handle in ipairs(handles) do
 		handle:Cancel(runtimeShutdownReason)
 	end
-
 	return true
+end
+
+function TaskRuntime.cancellationSource(parentToken)
+	return CancellationSource.new(parentToken)
 end
 
 local function findCleanupMethod(resource)
@@ -518,12 +947,10 @@ local function findCleanupMethod(resource)
 		local succeeded, method = pcall(function()
 			return resource[methodName]
 		end)
-
 		if succeeded and type(method) == "function" then
 			return methodName
 		end
 	end
-
 	return nil
 end
 
@@ -534,19 +961,18 @@ local function cleanupResource(resource, cleanupMethod, reason)
 	end
 
 	if type(cleanupMethod) == "function" then
-		cleanupMethod(resource)
+		cleanupMethod(resource, reason)
 		return
 	end
 
 	if type(resource) == "function" and cleanupMethod == nil then
-		resource()
+		resource(reason)
 		return
 	end
 
 	if cleanupMethod == nil then
 		cleanupMethod = findCleanupMethod(resource)
 	end
-
 	if cleanupMethod == nil then
 		error("no cleanup method found for resource")
 	end
@@ -555,18 +981,27 @@ local function cleanupResource(resource, cleanupMethod, reason)
 	if type(method) ~= "function" then
 		error("cleanup method " .. tostring(cleanupMethod) .. " is not callable")
 	end
-	method(resource)
+	method(resource, reason)
 end
 
-function CleanupScope.new(name)
+function CleanupScope.new(name, options)
+	if options == nil then
+		options = {}
+	elseif type(options) ~= "table" then
+		error("CleanupScope.new expects options to be a table or nil", 2)
+	end
+
 	return setmetatable({
 		Name = name or "CleanupScope",
+		CancelOnTaskFailure = options.cancelOnTaskFailure == true,
 		_entries = {},
 		_keyedEntries = {},
 		_destroyed = false,
 		_cleaning = false,
 		_cleanupComplete = false,
 		_cleanupCallbacks = {},
+		_cleanupErrors = {},
+		_taskFailures = {},
 		_pendingTasks = {},
 		_pendingScopes = {},
 	}, CleanupScope)
@@ -584,12 +1019,50 @@ function CleanupScope:GetCount()
 	return #self._entries
 end
 
-function CleanupScope:_OnCleanupComplete(callback)
-	assertCallback(callback, "CleanupScope:_OnCleanupComplete")
+function CleanupScope:GetCleanupErrors()
+	local errors = {}
+	for index, value in ipairs(self._cleanupErrors) do
+		errors[index] = value
+	end
+	return errors
+end
+
+function CleanupScope:HasCleanupErrors()
+	return #self._cleanupErrors > 0
+end
+
+function CleanupScope:GetTaskFailures()
+	local failures = {}
+	for index, value in ipairs(self._taskFailures) do
+		failures[index] = value
+	end
+	return failures
+end
+
+function CleanupScope:OnCleanupComplete(callback)
+	assertCallback(callback, "CleanupScope:OnCleanupComplete")
 	if self._cleanupComplete then
-		callback(self)
-	else
-		table.insert(self._cleanupCallbacks, callback)
+		invokeSafely(callback, "scope completion callback failed", self)
+		return disconnectedConnection()
+	end
+	return registerCallback(self._cleanupCallbacks, callback)
+end
+
+function CleanupScope:_OnCleanupComplete(callback)
+	return self:OnCleanupComplete(callback)
+end
+
+function CleanupScope:_RecordCleanupError(message, resource, method)
+	local record = {
+		Message = tostring(message),
+		Resource = resource,
+		CleanupMethod = method,
+	}
+	table.insert(self._cleanupErrors, record)
+
+	local handlerSucceeded, handlerError = pcall(cleanupErrorHandler, record.Message, self, record)
+	if not handlerSucceeded then
+		warn("[TaskRuntime] cleanup error handler failed: " .. tostring(handlerError))
 	end
 end
 
@@ -604,14 +1077,14 @@ function CleanupScope:_CheckCleanupComplete()
 	self._cleanupComplete = true
 	local callbacks = self._cleanupCallbacks
 	self._cleanupCallbacks = {}
-
-	for _, callback in ipairs(callbacks) do
-		local succeeded, callbackError = pcall(callback, self)
-		if not succeeded then
-			warn("[TaskRuntime] scope completion callback failed: " .. tostring(callbackError))
+	for _, entry in ipairs(callbacks) do
+		if entry.Active and entry.Callback ~= nil then
+			local callback = entry.Callback
+			entry.Active = false
+			entry.Callback = nil
+			invokeSafely(callback, "scope completion callback failed", self)
 		end
 	end
-
 	return true
 end
 
@@ -621,7 +1094,7 @@ function CleanupScope:_TrackTask(handle)
 	end
 
 	self._pendingTasks[handle] = true
-	handle:_OnFinished(function()
+	handle:OnComplete(function()
 		self._pendingTasks[handle] = nil
 		self:_CheckCleanupComplete()
 	end)
@@ -633,8 +1106,15 @@ function CleanupScope:_TrackScope(scope)
 	end
 
 	self._pendingScopes[scope] = true
-	scope:_OnCleanupComplete(function()
+	scope:OnCleanupComplete(function()
 		self._pendingScopes[scope] = nil
+		for _, childError in ipairs(scope:GetCleanupErrors()) do
+			self:_RecordCleanupError(
+				"child scope " .. tostring(scope.Name) .. ": " .. tostring(childError.Message),
+				childError.Resource,
+				childError.CleanupMethod
+			)
+		end
 		self:_CheckCleanupComplete()
 	end)
 end
@@ -655,7 +1135,6 @@ function CleanupScope:_DetachEntry(entry)
 			break
 		end
 	end
-
 	return true
 end
 
@@ -676,16 +1155,26 @@ function CleanupScope:_AddEntry(resource, cleanupMethod, key)
 		Key = key,
 		Active = true,
 	}
-
 	table.insert(self._entries, entry)
 	if key ~= nil then
 		self._keyedEntries[key] = entry
 	end
 
-	-- Completed tasks should not remain strongly referenced for the lifetime of a
-	-- long-running scope.
 	if getmetatable(resource) == TaskHandle then
-		resource:_OnFinished(function()
+		resource:OnComplete(function(handle)
+			self:_DetachEntry(entry)
+			if handle.State == "failed" then
+				table.insert(self._taskFailures, {
+					Handle = handle,
+					Error = handle.Error,
+				})
+				if self.CancelOnTaskFailure and not self._destroyed and not self._cleaning then
+					self:Destroy("owned task failed: " .. tostring(handle.Name))
+				end
+			end
+		end)
+	elseif getmetatable(resource) == CleanupScope then
+		resource:OnCleanupComplete(function()
 			self:_DetachEntry(entry)
 		end)
 	end
@@ -697,12 +1186,10 @@ function CleanupScope:Add(resource, cleanupMethod)
 	return self:_AddEntry(resource, cleanupMethod, nil)
 end
 
--- Registers a named resource. Replacing a key cleans the previous resource first.
 function CleanupScope:Set(key, resource, cleanupMethod)
 	if key == nil then
 		error("CleanupScope:Set expects a non-nil key", 2)
 	end
-
 	self:Remove(key, true, "resource replaced: " .. tostring(key))
 	return self:_AddEntry(resource, cleanupMethod, key)
 end
@@ -719,7 +1206,6 @@ function CleanupScope:Has(key)
 	return self:Get(key) ~= nil
 end
 
--- Removes a named resource. Cleanup is enabled by default.
 function CleanupScope:Remove(key, shouldCleanup, reason)
 	local entry = self._keyedEntries[key]
 	if entry == nil or not entry.Active then
@@ -735,10 +1221,9 @@ function CleanupScope:Remove(key, shouldCleanup, reason)
 			reason or ("resource removed: " .. tostring(key))
 		)
 		if not succeeded then
-			warn("[TaskRuntime] cleanup failed in " .. self.Name .. ": " .. tostring(cleanupError))
+			self:_RecordCleanupError(cleanupError, entry.Resource, entry.CleanupMethod)
 		end
 	end
-
 	return entry.Resource
 end
 
@@ -764,8 +1249,16 @@ function CleanupScope:Every(seconds, callback, ...)
 	return self:Add(TaskRuntime.every(seconds, callback, ...), "Cancel")
 end
 
-function CleanupScope:Child(name)
-	return self:Add(CleanupScope.new(name), "Destroy")
+function CleanupScope:WithTimeout(seconds, callback, ...)
+	return self:Add(TaskRuntime.withTimeout(seconds, callback, ...), "Cancel")
+end
+
+function CleanupScope:Retry(attemptCount, callback, options, ...)
+	return self:Add(TaskRuntime.retry(attemptCount, callback, options, ...), "Cancel")
+end
+
+function CleanupScope:Child(name, options)
+	return self:Add(CleanupScope.new(name, options), "Destroy")
 end
 
 function CleanupScope:Cleanup(reason)
@@ -796,7 +1289,7 @@ function CleanupScope:Cleanup(reason)
 			reason or (self.Name .. " cleaned up")
 		)
 		if not succeeded then
-			warn("[TaskRuntime] cleanup failed in " .. self.Name .. ": " .. tostring(cleanupError))
+			self:_RecordCleanupError(cleanupError, resource, entry.CleanupMethod)
 		end
 	end
 
@@ -810,9 +1303,6 @@ function CleanupScope:Destroy(reason)
 	return self:Cleanup(reason or (self.Name .. " destroyed"))
 end
 
--- Requests cleanup and waits until all directly owned tasks and child scopes have
--- actually finished. The optional timeout returns false, "timeout" instead of
--- waiting forever for a non-cooperative task.
 function CleanupScope:DestroyAndAwait(reason, timeoutSeconds)
 	if timeoutSeconds ~= nil then
 		assertSeconds(timeoutSeconds, "CleanupScope:DestroyAndAwait", false)
@@ -834,6 +1324,9 @@ function CleanupScope:DestroyAndAwait(reason, timeoutSeconds)
 		wait(0)
 	end
 
+	if self:HasCleanupErrors() then
+		return false, "cleanup failed", self:GetCleanupErrors()
+	end
 	return true
 end
 
@@ -841,13 +1334,14 @@ function CleanupScope:_Dispose()
 	return self:Destroy(self.Name .. " disposed")
 end
 
-function TaskRuntime.scope(name)
-	return CleanupScope.new(name)
+function TaskRuntime.scope(name, options)
+	return CleanupScope.new(name, options)
 end
 
 TaskRuntime.Handle = TaskHandle
 TaskRuntime.CancellationToken = CancellationToken
-TaskRuntime.CancellationConnection = CancellationConnection
+TaskRuntime.CancellationSource = CancellationSource
+TaskRuntime.CallbackConnection = CallbackConnection
 TaskRuntime.CleanupScope = CleanupScope
 
 return TaskRuntime
