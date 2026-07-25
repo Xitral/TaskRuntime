@@ -6,7 +6,7 @@
 
 - `scripts/modules/TaskRuntime.luau`: reusable ModuleScript.
 - `scripts/server/script.server.luau`: server lifecycle bootstrap using a root cleanup scope.
-- `tests/task-runtime.spec.luau`: manual Creator self-test.
+- `tests/task-runtime-test.server.luau`: linked Creator self-test.
 
 In Creator, link `TaskRuntime.luau` as a `ModuleScript` named `TaskRuntime` under `ScriptService`. The server bootstrap expects it at `game["ScriptService"]["TaskRuntime"]`.
 
@@ -47,15 +47,9 @@ A task handle exposes:
 - `Await()`
 - `Token`
 - `State`, `Error`, `CancelReason`, results, and timing fields
+- `Iterations` and `SkippedIntervals` for repeating tasks
 
-Task states are:
-
-- `scheduled`
-- `running`
-- `cancelling`
-- `completed`
-- `cancelled`
-- `failed`
+Task states are `scheduled`, `running`, `cancelling`, `completed`, `cancelled`, and `failed`.
 
 Pending tasks cancel immediately. Running tasks enter `cancelling` and remain active until their callback exits, so `Await()` and `getActiveCount()` do not report a task as finished while its code is still executing.
 
@@ -85,11 +79,56 @@ TaskRuntime.spawn(function(token)
 end)
 ```
 
+## Immediate cancellation callbacks
+
+Use `token:OnCancel(callback)` when cleanup must happen as soon as cancellation is requested rather than during the next polling loop.
+
+```luau
+local worker = TaskRuntime.spawn(function(token)
+	local connection = token:OnCancel(function(reason)
+		print("Worker stopping:", reason)
+	end)
+
+	while not token:IsCancelled() do
+		TaskRuntime.wait(0)
+	end
+end)
+```
+
+`OnCancel` returns a connection with `Disconnect()`. It can be registered in a cleanup scope because the scope automatically recognizes the `Disconnect` method. Registering after cancellation invokes the callback immediately and returns an already-disconnected connection.
+
 The token exposes:
 
 - `IsCancelled()`
 - `GetReason()`
 - `Wait(seconds, pollInterval?)`
+- `OnCancel(callback)`
+
+## Repeating tasks
+
+Use `TaskRuntime.every` or `scope:Every` for autosaves, regeneration, status updates, and other repeating work.
+
+```luau
+local autosave = TaskRuntime.every(30, function(token)
+	savePlayers()
+end)
+
+-- Later:
+autosave:Cancel("server shutting down")
+autosave:Await()
+```
+
+A repeating task waits one interval before its first run. Iterations execute sequentially and never overlap. Its schedule remains anchored to the intended cadence; if a callback takes too long, missed intervals are counted in `SkippedIntervals` and skipped instead of replayed in a burst.
+
+```luau
+local scope = TaskRuntime.scope("Round")
+
+local statusTask = scope:Every(1, function(token)
+	updateRoundTimer()
+end)
+```
+
+Passing `0` runs once per physics frame.
 
 ## Cleanup scopes
 
@@ -122,6 +161,22 @@ scope:Destroy("round ended")
 - A resource with an auto-detected `Cancel`, `Disconnect`, `Cleanup`, `Destroy`, or `Close` method.
 
 Completed, failed, and cancelled tasks automatically detach from their scope, preventing long-lived scopes from retaining old task handles. `scope:GetCount()` returns the number of resources the scope currently owns.
+
+## Guaranteed awaited cleanup
+
+`Destroy()` requests cleanup and returns immediately. `DestroyAndAwait()` waits until all directly owned tasks and all nested child scopes have actually finished cleaning up.
+
+```luau
+local success, reason = roundScope:DestroyAndAwait("round ended", 5)
+
+if not success then
+	warn("Round cleanup timed out:", reason)
+end
+```
+
+The timeout is optional. Without it, the call waits indefinitely for every cooperative task to exit. With a timeout, it returns `false, "timeout"` if cleanup takes too long. `IsCleanupComplete()` reports whether the scope and all nested work are fully finished.
+
+Do not call `DestroyAndAwait()` from a task owned by the same scope, because that task would be waiting for itself to finish. Request destruction from an external controller or use `Destroy()` inside the owned task.
 
 ## Named resources
 
@@ -161,7 +216,7 @@ Named-resource methods:
 print(TaskRuntime.getActiveCount())
 
 for _, handle in ipairs(TaskRuntime.getActiveTasks()) do
-	print(handle.Id, handle.Kind, handle.State)
+	print(handle.Id, handle.Kind, handle.State, handle.Iterations)
 end
 ```
 
@@ -177,13 +232,23 @@ function Shutdown()
 	scope:Destroy("script shutdown")
 end
 
+function ShutdownAndAwait()
+	return scope:DestroyAndAwait("script shutdown", 5)
+end
+
 function _Dispose()
 	Shutdown()
 end
 ```
 
-The current game-side runtime does not automatically invoke `_Dispose()`. `Shutdown()` can be called explicitly with `BaseScript:Call()` today, while `_Dispose()` is already in place for a future engine lifecycle hook.
+The current game-side runtime does not automatically invoke `_Dispose()`. `Shutdown()` or `ShutdownAndAwait()` can be called explicitly with `BaseScript:Call()` today, while `_Dispose()` is already in place for a future engine lifecycle hook.
 
-## Verification
+## Verification in Creator
 
-After linking the module, run `tests/task-runtime.spec.luau` manually in Creator. It verifies result forwarding, pending and running cancellation, cancellation-token behavior, automatic scope detachment, named resources, reverse-order cleanup, error handling, and task release.
+`tests/task-runtime-test.server.luau` is already linked as a ServerScript in this project. Start a normal local playtest and watch the console; the test runs automatically. Disable or delete the test ServerScript after verification so it does not execute during ordinary development.
+
+The test verifies result forwarding, pending and running cancellation, immediate cancellation callbacks, disconnected callbacks, automatic scope detachment, named resources, non-overlapping repeating tasks, recursive `DestroyAndAwait`, reverse-order cleanup, error handling, and task release. A successful run prints:
+
+```text
+TaskRuntime self-test passed
+```

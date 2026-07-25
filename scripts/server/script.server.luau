@@ -6,12 +6,16 @@
 local TaskRuntime = require(game["ScriptService"]["TaskRuntime"])
 local rootScope = TaskRuntime.scope("ServerRoot")
 
--- Example:
+-- Examples:
 -- rootScope:Delay(5, function(token)
 -- 	if token:IsCancelled() then
 -- 		return
 -- 	end
 -- 	print("Five seconds elapsed")
+-- end)
+--
+-- rootScope:Every(30, function(token)
+-- 	print("Periodic server work")
 -- end)
 --
 -- rootScope:Connect(game["Players"].PlayerAdded, function(player)
@@ -22,8 +26,13 @@ function Shutdown()
 	rootScope:Destroy("server root shutdown")
 end
 
+function ShutdownAndAwait()
+	return rootScope:DestroyAndAwait("server root shutdown", 5)
+end
+
 -- This is ready for the engine lifecycle hook once Polytoria invokes _Dispose.
--- Until then, Shutdown() can be called explicitly through BaseScript:Call().
+-- Until then, Shutdown() or ShutdownAndAwait() can be called explicitly through
+-- BaseScript:Call().
 function _Dispose()
 	Shutdown()
 end
