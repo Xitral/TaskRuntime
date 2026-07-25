@@ -1,0 +1,210 @@
+name: Fix TaskRuntime aggregate completion ordering
+
+on:
+  push:
+    paths:
+      - .github/taskruntime-aggregate-fix.trigger
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+      - name: Patch runtime and tests
+        shell: python
+        run: |
+          from pathlib import Path
+
+          runtime_path = Path("scripts/modules/TaskRuntime.luau")
+          source = runtime_path.read_text()
+
+          replacements = [
+              ('TaskRuntime.VERSION = "3.0.1"', 'TaskRuntime.VERSION = "3.0.2"'),
+              ('''\tlocal function complete(values)
+\t\tif settled or aggregate:IsDone() then
+\t\t\treturn false
+\t\tend
+\t\tsettled = true
+\t\tdisconnectAll()
+\t\tself:_CompleteHandle(aggregate, values)
+\t\treturn true
+\tend
+\tlocal function fail(taskError)
+\t\tif settled or aggregate:IsDone() then
+\t\t\treturn false
+\t\tend
+\t\tsettled = true
+\t\tdisconnectAll()
+\t\tself:_FailHandle(aggregate, taskError)
+\t\treturn true
+\tend''', '''\tlocal function settle(finalize, beforeFinish)
+\t\tif settled or aggregate:IsDone() then
+\t\t\treturn false
+\t\tend
+\t\tsettled = true
+\t\tdisconnectAll()
+\t\tif beforeFinish ~= nil then
+\t\t\tlocal succeeded, effectError = pcall(beforeFinish)
+\t\t\tif not succeeded then
+\t\t\t\tself:_Warn("[TaskRuntime] aggregate pre-finish action failed: " .. tostring(effectError))
+\t\t\tend
+\t\tend
+\t\tfinalize()
+\t\treturn true
+\tend
+\tlocal function complete(values, beforeFinish)
+\t\treturn settle(function()
+\t\t\tself:_CompleteHandle(aggregate, values)
+\t\tend, beforeFinish)
+\tend
+\tlocal function fail(taskError, beforeFinish)
+\t\treturn settle(function()
+\t\t\tself:_FailHandle(aggregate, taskError)
+\t\tend, beforeFinish)
+\tend'''),
+              ('''\t\t\t\tif failFast and not outcome.Success then
+\t\t\t\t\tlocal reason = outcome.Error and outcome.Error.Message or outcome.CancellationReason or outcome.Status
+\t\t\t\t\tlocal settledNow = fail(self:_MakeTaskError(aggregate, "CHILD_TASK_FAILED", "child " .. tostring(index) .. " " .. outcome.Status .. ": " .. tostring(reason), {
+\t\t\t\t\t\tCause = outcome.Error,
+\t\t\t\t\t}))
+\t\t\t\t\tif settledNow and cancelOnFailure then
+\t\t\t\t\t\tcancelRemaining(handles, index, "TaskRuntime.all child did not complete")
+\t\t\t\t\tend
+\t\t\t\t\treturn
+\t\t\t\tend''', '''\t\t\t\tif failFast and not outcome.Success then
+\t\t\t\t\tlocal reason = outcome.Error and outcome.Error.Message or outcome.CancellationReason or outcome.Status
+\t\t\t\t\tlocal beforeFinish = nil
+\t\t\t\t\tif cancelOnFailure then
+\t\t\t\t\t\tbeforeFinish = function()
+\t\t\t\t\t\t\tcancelRemaining(handles, index, "TaskRuntime.all child did not complete")
+\t\t\t\t\t\tend
+\t\t\t\t\tend
+\t\t\t\t\tfail(self:_MakeTaskError(aggregate, "CHILD_TASK_FAILED", "child " .. tostring(index) .. " " .. outcome.Status .. ": " .. tostring(reason), {
+\t\t\t\t\t\tCause = outcome.Error,
+\t\t\t\t\t}), beforeFinish)
+\t\t\t\t\treturn
+\t\t\t\tend'''),
+              ('''\t\t\t\t\tlocal outcome = completedHandle:GetOutcome()
+\t\t\t\t\tlocal settledNow = false
+\t\t\t\t\tif outcome.Success then
+\t\t\t\t\t\tlocal values = { n = (outcome.Values and outcome.Values.n or 0) + 1 }
+\t\t\t\t\t\tvalues[1] = index
+\t\t\t\t\t\tif outcome.Values ~= nil then
+\t\t\t\t\t\t\tfor valueIndex = 1, outcome.Values.n do
+\t\t\t\t\t\t\t\tvalues[valueIndex + 1] = outcome.Values[valueIndex]
+\t\t\t\t\t\t\tend
+\t\t\t\t\t\tend
+\t\t\t\t\t\tsettledNow = complete(values)
+\t\t\t\t\telse
+\t\t\t\t\t\tlocal reason = outcome.Error and outcome.Error.Message or outcome.CancellationReason or outcome.Status
+\t\t\t\t\t\tsettledNow = fail(self:_MakeTaskError(aggregate, "RACE_WINNER_FAILED", "winner " .. tostring(index) .. " " .. outcome.Status .. ": " .. tostring(reason), {
+\t\t\t\t\t\t\tCause = outcome.Error,
+\t\t\t\t\t\t}))
+\t\t\t\t\tend
+\t\t\t\t\tif settledNow and cancelLosers then
+\t\t\t\t\t\tcancelRemaining(handles, index, "TaskRuntime.race lost")
+\t\t\t\t\tend''', '''\t\t\t\t\tlocal outcome = completedHandle:GetOutcome()
+\t\t\t\t\tlocal beforeFinish = nil
+\t\t\t\t\tif cancelLosers then
+\t\t\t\t\t\tbeforeFinish = function()
+\t\t\t\t\t\t\tcancelRemaining(handles, index, "TaskRuntime.race lost")
+\t\t\t\t\t\tend
+\t\t\t\t\tend
+\t\t\t\t\tif outcome.Success then
+\t\t\t\t\t\tlocal values = { n = (outcome.Values and outcome.Values.n or 0) + 1 }
+\t\t\t\t\t\tvalues[1] = index
+\t\t\t\t\t\tif outcome.Values ~= nil then
+\t\t\t\t\t\t\tfor valueIndex = 1, outcome.Values.n do
+\t\t\t\t\t\t\t\tvalues[valueIndex + 1] = outcome.Values[valueIndex]
+\t\t\t\t\t\t\tend
+\t\t\t\t\t\tend
+\t\t\t\t\t\tcomplete(values, beforeFinish)
+\t\t\t\t\telse
+\t\t\t\t\t\tlocal reason = outcome.Error and outcome.Error.Message or outcome.CancellationReason or outcome.Status
+\t\t\t\t\t\tfail(self:_MakeTaskError(aggregate, "RACE_WINNER_FAILED", "winner " .. tostring(index) .. " " .. outcome.Status .. ": " .. tostring(reason), {
+\t\t\t\t\t\t\tCause = outcome.Error,
+\t\t\t\t\t\t}), beforeFinish)
+\t\t\t\t\tend'''),
+              ('''\t\t\t\t\t\tlocal settledNow = complete(values)
+\t\t\t\t\t\tif settledNow and cancelLosers then
+\t\t\t\t\t\t\tcancelRemaining(handles, index, "TaskRuntime.any lost")
+\t\t\t\t\t\tend
+\t\t\t\t\t\treturn''', '''\t\t\t\t\t\tlocal beforeFinish = nil
+\t\t\t\t\t\tif cancelLosers then
+\t\t\t\t\t\t\tbeforeFinish = function()
+\t\t\t\t\t\t\t\tcancelRemaining(handles, index, "TaskRuntime.any lost")
+\t\t\t\t\t\t\tend
+\t\t\t\t\t\tend
+\t\t\t\t\t\tcomplete(values, beforeFinish)
+\t\t\t\t\t\treturn'''),
+          ]
+
+          for old, new in replacements:
+              count = source.count(old)
+              if count != 1:
+                  raise RuntimeError(f"expected one runtime match, found {count}: {old[:80]!r}")
+              source = source.replace(old, new, 1)
+
+          runtime_path.write_text(source)
+
+          test_path = Path("scripts/tests/task-runtime-test.server.luau")
+          tests = test_path.read_text()
+
+          old_all = '''expectEqual(allResults[2][1], "second", "all should preserve second result")
+
+local settleSuccessTask'''
+          new_all = '''expectEqual(allResults[2][1], "second", "all should preserve second result")
+
+local allFailure = TaskRuntime.spawn(function()
+\terror("fail fast")
+end)
+local allSlow = TaskRuntime.delay(0.5, function()
+\treturn "too late"
+end)
+local failedAll = TaskRuntime.all({ allFailure, allSlow })
+local failedAllSuccess = failedAll:Await(1)
+expect(not failedAllSuccess, "all should fail when a child fails")
+expectEqual(allSlow.State, "cancelled", "all should cancel unfinished siblings before completing")
+
+local settleSuccessTask'''
+
+          old_any = '''local anySuccessTask = TaskRuntime.delay(0.005, function()
+\treturn "winner"
+end)
+local anyTask = TaskRuntime.any({ anyFailure, anySuccessTask })
+local anySuccess, anyIndex, anyValue = anyTask:Await(1)
+expect(anySuccess and anyIndex == 2 and anyValue == "winner", "any should return the first successful task")'''
+          new_any = '''local anySuccessTask = TaskRuntime.delay(0.005, function()
+\treturn "winner"
+end)
+local anySlow = TaskRuntime.delay(0.5, function()
+\treturn "late winner"
+end)
+local anyTask = TaskRuntime.any({ anyFailure, anySuccessTask, anySlow })
+local anySuccess, anyIndex, anyValue = anyTask:Await(1)
+expect(anySuccess and anyIndex == 2 and anyValue == "winner", "any should return the first successful task")
+expectEqual(anySlow.State, "cancelled", "any should cancel losers before completing")'''
+
+          for old, new in ((old_all, new_all), (old_any, new_any)):
+              count = tests.count(old)
+              if count != 1:
+                  raise RuntimeError(f"expected one test match, found {count}: {old[:80]!r}")
+              tests = tests.replace(old, new, 1)
+
+          test_path.write_text(tests)
+      - name: Remove one-time workflow
+        run: |
+          rm -f .github/workflows/fix-taskruntime-aggregate.yml
+          rm -f .github/taskruntime-aggregate-fix.trigger
+      - name: Commit repair
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add scripts/modules/TaskRuntime.luau scripts/tests/task-runtime-test.server.luau .github/workflows/fix-taskruntime-aggregate.yml .github/taskruntime-aggregate-fix.trigger
+          git commit -m "Fix aggregate cancellation ordering"
+          git push origin master
