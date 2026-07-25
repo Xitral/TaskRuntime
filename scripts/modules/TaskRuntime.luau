@@ -3,7 +3,7 @@
 -- bounded concurrency, diagnostics, and deterministic cleanup for Polytoria Luau.
 
 local TaskRuntime = {}
-TaskRuntime.VERSION = "3.0.2"
+TaskRuntime.VERSION = "3.0.3"
 
 local Runtime = {}
 Runtime.__index = Runtime
@@ -185,6 +185,7 @@ end
 local function normalizeScheduler(scheduler)
 	if scheduler == nil then
 		return {
+			supportsParking = false,
 			now = function()
 				return time()
 			end,
@@ -212,6 +213,7 @@ local function normalizeScheduler(scheduler)
 
 	if type(scheduler.now) == "function" and type(scheduler.spawn) == "function" and type(scheduler.sleep) == "function" then
 		return {
+			supportsParking = scheduler.supportsParking == true,
 			now = scheduler.now,
 			spawn = scheduler.spawn,
 			sleep = scheduler.sleep,
@@ -226,6 +228,7 @@ local function normalizeScheduler(scheduler)
 
 	if type(scheduler.Now) == "function" and type(scheduler.Spawn) == "function" and type(scheduler.Sleep) == "function" then
 		return {
+			supportsParking = scheduler.SupportsParking == true,
 			now = function()
 				return scheduler:Now()
 			end,
@@ -657,10 +660,10 @@ function Runtime:_AwaitRegistration(register, timeoutSeconds, timeoutValues)
 		end
 	end
 
-	-- Polytoria runs pcall callbacks in an engine-managed coroutine. A raw
-	-- coroutine.yield inside that callback is treated as the callback returning,
-	-- so waits inside TaskRuntime tasks must yield through the engine scheduler.
-	if self:_GetCurrentTask() == nil and isYieldable() then
+	-- Raw coroutine parking is only safe for schedulers that explicitly support it.
+	-- Polytoria's engine-managed pcall creates nested coroutines, so the default
+	-- scheduler uses wait(0) polling instead of allowing a raw yield to escape.
+	if self._scheduler.supportsParking and isYieldable() then
 		parkedThread = coroutine.running()
 		return coroutine.yield({ __taskRuntimePark = true })
 	end
@@ -2531,6 +2534,7 @@ end
 
 function TestScheduler.new(startTime)
 	return setmetatable({
+		SupportsParking = true,
 		_time = startTime or 0,
 		_ready = {},
 		_sleeping = {},

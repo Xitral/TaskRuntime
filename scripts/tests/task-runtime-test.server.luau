@@ -170,6 +170,16 @@ end)
 local nestedAwaitSuccess, nestedAwaitValue = nestedAwait:Await(2)
 expect(nestedAwaitSuccess and nestedAwaitValue == "parent done", "nested await should complete the parent")
 
+-- Polytoria pcall runs its callback in another engine-managed coroutine.
+local protectedWait = TaskRuntime.spawn(function(token)
+	local succeeded, value = pcall(function()
+		token:Wait(0.05)
+		return "protected wait done"
+	end)
+	expect(succeeded and value == "protected wait done", "wait inside pcall should resume normally")
+end)
+expect(protectedWait:Await(1), "protected wait task should complete")
+
 -- all, settle, race, and any use completion callbacks rather than frame polling.
 local first = TaskRuntime.delay(0.02, function()
 	return "first"
