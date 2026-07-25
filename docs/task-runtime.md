@@ -5,7 +5,7 @@
 ## Files
 
 - `scripts/modules/TaskRuntime.luau`: reusable ModuleScript.
-- `scripts/client/script.server.luau`: server lifecycle bootstrap using a root cleanup scope.
+- `scripts/server/script.server.luau`: server lifecycle bootstrap using a root cleanup scope.
 - `tests/task-runtime.spec.luau`: manual Creator self-test.
 
 In Creator, link `TaskRuntime.luau` as a `ModuleScript` named `TaskRuntime` under `ScriptService`. The server bootstrap expects it at `game["ScriptService"]["TaskRuntime"]`.
