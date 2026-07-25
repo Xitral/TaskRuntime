@@ -10,6 +10,7 @@ REQUIRED_FILES = (
     "VERSION",
     "README.md",
     "LICENSE",
+    "AI_DISCLOSURE.md",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
     "SECURITY.md",
@@ -60,12 +61,17 @@ def main() -> None:
     readme = read("README.md")
     docs = read("docs/task-runtime.md")
     changelog = read("CHANGELOG.md")
+    disclosure = read("AI_DISCLOSURE.md")
     if f"Current release: {version}" not in readme:
         fail("README current release does not match VERSION")
     if f"```text\n{version}\n```" not in docs:
         fail("documentation current version does not match VERSION")
     if f"## [{version}]" not in changelog:
         fail("CHANGELOG has no section for VERSION")
+    if "[AI assistance disclosure](AI_DISCLOSURE.md)" not in readme:
+        fail("README does not link to AI_DISCLOSURE.md")
+    if "generative AI" not in disclosure or "project maintainer" not in disclosure:
+        fail("AI disclosure is incomplete")
 
     self_test = read("scripts/tests/task-runtime-test.server.luau")
     stress_test = read("scripts/tests/task-runtime-stress-test.server.luau")
