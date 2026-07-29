@@ -78,6 +78,7 @@ Direct mode intentionally does not wrap task callbacks in `pcall`. A thrown call
 ## Documentation
 
 - [Complete guide](docs/task-runtime.md)
+- [Polytoria-safe callback guide](docs/polytoria-safe-callbacks.md)
 - [Copy-paste examples](docs/task-runtime-examples.md)
 - [AI assistance disclosure](AI_DISCLOSURE.md)
 - [Contributing](CONTRIBUTING.md)
