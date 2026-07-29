@@ -17,11 +17,14 @@ REQUIRED_FILES = (
     "CODE_OF_CONDUCT.md",
     "RELEASING.md",
     "scripts/modules/TaskRuntime.luau",
+    "scripts/modules/TaskRuntimePolytoriaSafe.luau",
     "scripts/modules/TaskRuntimeTypes.luau",
     "scripts/tests/task-runtime-test.server.luau",
     "scripts/tests/task-runtime-stress-test.server.luau",
+    "scripts/tests/task-runtime-polytoria-safe-test.server.luau",
     "docs/task-runtime.md",
     "docs/task-runtime-examples.md",
+    "docs/polytoria-safe-callbacks.md",
     ".github/workflows/validate.yml",
     ".github/workflows/release.yml",
 )
@@ -58,8 +61,17 @@ def main() -> None:
             f"({match.group(1)!r} != {version!r})"
         )
 
+    adapter = read("scripts/modules/TaskRuntimePolytoriaSafe.luau")
+    if "TaskRuntime.SUPPORTS_POLYTORIA_SAFE_CALLBACKS = true" not in adapter:
+        fail("Polytoria-safe adapter feature flag is missing")
+    if "function TaskRuntime.createPolytoriaSafe" not in adapter:
+        fail("Polytoria-safe runtime constructor is missing")
+    if 'callbackMode ~= "protected" and callbackMode ~= "direct"' not in adapter:
+        fail("Polytoria-safe callback mode validation is missing")
+
     readme = read("README.md")
     docs = read("docs/task-runtime.md")
+    safe_docs = read("docs/polytoria-safe-callbacks.md")
     changelog = read("CHANGELOG.md")
     disclosure = read("AI_DISCLOSURE.md")
     if f"Current release: {version}" not in readme:
@@ -68,6 +80,8 @@ def main() -> None:
         fail("documentation current version does not match VERSION")
     if f"## [{version}]" not in changelog:
         fail("CHANGELOG has no section for VERSION")
+    if "createPolytoriaSafe" not in readme or "createPolytoriaSafe" not in safe_docs:
+        fail("Polytoria-safe adapter documentation is incomplete")
     if "[AI assistance disclosure](AI_DISCLOSURE.md)" not in readme:
         fail("README does not link to AI_DISCLOSURE.md")
     if "generative AI" not in disclosure or "project maintainer" not in disclosure:
@@ -75,10 +89,13 @@ def main() -> None:
 
     self_test = read("scripts/tests/task-runtime-test.server.luau")
     stress_test = read("scripts/tests/task-runtime-stress-test.server.luau")
+    safe_test = read("scripts/tests/task-runtime-polytoria-safe-test.server.luau")
     if "TaskRuntime self-test passed" not in self_test:
         fail("integration self-test success marker is missing")
     if "TaskRuntime stress test passed" not in stress_test:
         fail("stress-test success marker is missing")
+    if "TaskRuntime Polytoria-safe adapter test passed" not in safe_test:
+        fail("Polytoria-safe adapter test success marker is missing")
 
     banned = "industry" + "-grade"
     for path in ROOT.rglob("*"):
@@ -95,6 +112,11 @@ def main() -> None:
         lowered = path.name.lower()
         if "prepare-taskruntime" in lowered or "fix-taskruntime" in lowered:
             fail(f"one-time workflow was not removed: {path.name}")
+        if "apply-3-0-4" in lowered:
+            fail(f"stalled migration workflow was not removed: {path.name}")
+
+    if (ROOT / "tools" / "apply_3_0_4.py").exists():
+        fail("stalled 3.0.4 migration script was not removed")
 
     ref_type = os.environ.get("GITHUB_REF_TYPE")
     ref_name = os.environ.get("GITHUB_REF_NAME")
