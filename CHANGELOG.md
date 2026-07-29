@@ -4,6 +4,20 @@ All notable changes to TaskRuntime are documented here.
 
 The project follows semantic versioning.
 
+## Unreleased
+
+### Added
+
+- `TaskRuntimePolytoriaSafe.luau`, an optional compatibility adapter for yield-heavy callbacks on current Polytoria builds
+- `TaskRuntime.createPolytoriaSafe()` and opt-in `callbackMode = "direct"` runtimes
+- Creator regression coverage for yielding and resuming in direct callback mode
+
+### Compatibility
+
+- Existing `TaskRuntime` consumers remain in protected callback mode by default
+- Direct callbacks are not wrapped in `pcall`; thrown errors escape the scheduler thread instead of becoming structured failed task outcomes
+- `retry` is rejected in direct mode because retry behavior requires protected callback errors
+
 ## [3.0.3] - 2026-07-25
 
 First supported public release.
