@@ -18,7 +18,7 @@ Polytoria provides low-level primitives such as `spawn`, `wait`, and `pcall`. Ta
 - Cleanup deadlines and failure reporting
 - Runtime snapshots, bounded history, and aggregated task statistics
 - A virtual-time scheduler for deterministic tests
-- Polytoria-specific handling for waits inside the engine's custom `pcall`
+- An opt-in callback adapter for yield-heavy work on current Polytoria builds
 
 ## Install
 
@@ -54,6 +54,27 @@ end
 
 Destroying the scope cancels its tasks and cleans every registered resource.
 
+## Polytoria-safe yielding mode
+
+Current Polytoria builds execute `pcall` callbacks in a nested Lua thread. Yielding from that nested thread can destabilize the process in yield-heavy systems. The optional adapter keeps task callbacks in TaskRuntime's scheduler thread instead.
+
+Link `scripts/modules/TaskRuntimePolytoriaSafe.luau` beside the main module as `TaskRuntimePolytoriaSafe`, then create an isolated safe runtime:
+
+```luau
+local TaskRuntime = require(game["ScriptService"]["TaskRuntimePolytoriaSafe"])
+local runtime = TaskRuntime.createPolytoriaSafe()
+
+runtime:spawn(function(token)
+	while token:Wait(0.1) do
+		updateSystem()
+	end
+end)
+```
+
+Existing consumers remain in protected mode. Calling `TaskRuntime.create()` without `callbackMode = "direct"` preserves structured callback failures and all 3.0.3 behavior.
+
+Direct mode intentionally does not wrap task callbacks in `pcall`. A thrown callback error escapes the scheduler thread instead of becoming a failed `TaskHandle`. Keep direct-mode callbacks non-throwing, validate inputs before scheduling, and use cooperative cancellation. `retry` is unavailable in direct mode because retries require catching callback errors.
+
 ## Documentation
 
 - [Complete guide](docs/task-runtime.md)
@@ -78,6 +99,7 @@ For engine validation, sync these scripts into Creator and run them separately:
 ```text
 scripts/tests/task-runtime-test.server.luau
 scripts/tests/task-runtime-stress-test.server.luau
+scripts/tests/task-runtime-polytoria-safe-test.server.luau
 ```
 
 Successful runs print:
@@ -85,6 +107,7 @@ Successful runs print:
 ```text
 TaskRuntime self-test passed
 TaskRuntime stress test passed
+TaskRuntime Polytoria-safe adapter test passed
 ```
 
 ## Compatibility notes
@@ -92,6 +115,8 @@ TaskRuntime stress test passed
 Cancellation is cooperative. A running callback must check its token or use `token:Wait()` to stop promptly.
 
 TaskRuntime uses Polytoria's supported `wait` path for the default scheduler. Raw coroutine parking is only enabled for custom schedulers that explicitly declare support.
+
+The safe adapter is additive and does not change the tagged 3.0.3 core module. Require the adapter only for systems that need its direct callback mode.
 
 ## Versioning
 
