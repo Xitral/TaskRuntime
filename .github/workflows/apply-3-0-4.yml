@@ -1,0 +1,44 @@
+name: Apply TaskRuntime 3.0.4
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - tools/apply_3_0_4.py
+      - .github/workflows/apply-3-0-4.yml
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply release migration
+        run: python3 tools/apply_3_0_4.py
+
+      - name: Validate release metadata
+        run: python3 tools/validate_release.py
+
+      - name: Build release package
+        run: python3 tools/build_release.py
+
+      - name: Remove one-time migration
+        run: |
+          rm tools/apply_3_0_4.py
+          rm .github/workflows/apply-3-0-4.yml
+
+      - name: Commit TaskRuntime 3.0.4
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix: add Polytoria-safe callback mode"
+          git push origin HEAD:main
