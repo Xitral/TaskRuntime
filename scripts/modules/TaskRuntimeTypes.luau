@@ -1,6 +1,8 @@
 --!strict
 -- Optional type definitions for TaskRuntime consumers.
 
+export type CallbackMode = "protected" | "direct"
+
 export type TaskError = {
 	Code: string,
 	Message: string,
@@ -195,6 +197,7 @@ export type Runtime = {
 	queue: (self: Runtime, concurrency: number, options: any?) -> TaskQueue,
 	debounce: (self: Runtime, key: any, seconds: number, callback: (CancellationToken, ...any) -> ...any, ...any) -> TaskHandle,
 	throttle: (self: Runtime, key: any, seconds: number, callback: (CancellationToken, ...any) -> ...any, ...any) -> (TaskHandle?, TaskHandle?),
+	getCallbackMode: (self: Runtime) -> CallbackMode,
 	getSnapshot: (self: Runtime) -> any,
 	getHistory: (self: Runtime) -> { any },
 	getStats: (self: Runtime) -> { [string]: any },
